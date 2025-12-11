@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ONNX2TFLite 模型转换工具</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            background: #f5f5f7;
+            min-height: 100vh;
+            color: #1d1d1f;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .header {
+            text-align: center;
+            padding: 40px 0 30px;
+            background: linear-gradient(135deg, rgba(0,122,255,0.05) 0%, rgba(88,86,214,0.05) 100%);
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 600;
+            color: #1d1d1f;
+            margin-bottom: 8px;
+            letter-spacing: -0.015em;
+        }
+
+        .header p {
+            font-size: 1.125rem;
+            font-weight: 400;
+            color: #86868b;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+            padding: 0 0 30px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(20px);
+            border-radius: 16px;
+            padding: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+            transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 16px 64px rgba(0, 0, 0, 0.12);
+        }
+
+        .card h2 {
+            color: #1d1d1f;
+            margin-bottom: 16px;
+            font-size: 1.375rem;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        .upload-area {
+            border: 2px dashed #d2d2d7;
+            border-radius: 12px;
+            padding: 32px 24px;
+            text-align: center;
+            background: rgba(255, 255, 255, 0.6);
+            transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            cursor: pointer;
+        }
+
+        .upload-area:hover {
+            border-color: #007aff;
+            background: rgba(0, 122, 255, 0.05);
+            transform: scale(1.01);
+        }
+
+        .upload-area.dragging {
+            border-color: #007aff;
+            background: rgba(0, 122, 255, 0.1);
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 2.5rem;
+            margin-bottom: 8px;
+            opacity: 0.8;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .btn {
+            background: #007aff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            margin: 4px;
+            letter-spacing: -0.01em;
+        }
+
+        .btn:hover {
+            background: #0056cc;
+            transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(0, 122, 255, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+            box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .btn-success {
+            background: #28cd41;
+        }
+
+        .btn-success:hover {
+            background: #1fa334;
+            box-shadow: 0 12px 24px rgba(40, 205, 65, 0.3);
+        }
+
+        .btn-download {
+            background: #ff3b30;
+        }
+
+        .btn-download:hover {
+            background: #cc2e24;
+            box-shadow: 0 12px 24px rgba(255, 59, 48, 0.3);
+        }
+
+        .btn-quantize {
+            background: #ff9500;
+        }
+
+        .btn-quantize:hover {
+            background: #cc7700;
+            box-shadow: 0 12px 24px rgba(255, 149, 0, 0.3);
+        }
+
+        .layer-selection-grid {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            padding: 12px;
+            background: rgba(248, 248, 248, 0.8);
+        }
+
+        .options {
+            margin: 20px 0;
+        }
+
+        .option-item {
+            margin: 8px 0;
+            display: flex;
+            align-items: center;
+        }
+
+        .option-item input[type="checkbox"] {
+            margin-right: 8px;
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #007aff;
+        }
+
+        .option-item label {
+            cursor: pointer;
+            font-size: 0.875rem;
+            color: #1d1d1f;
+            font-weight: 400;
+        }
+
+        /* 校准数据上传样式 */
+        .calibration-upload-area:hover {
+            border-color: #005bb5 !important;
+            background: rgba(0, 122, 255, 0.1) !important;
+            transform: scale(1.02);
+        }
+
+        .calibration-upload-area.dragging {
+            border-color: #005bb5 !important;
+            background: rgba(0, 122, 255, 0.15) !important;
+            transform: scale(1.03);
+        }
+
+        .calibration-upload-section {
+            transition: all 0.3s ease;
+        }
+
+        .calibration-upload-section:hover {
+            box-shadow: 0 4px 16px rgba(0, 122, 255, 0.2);
+        }
+
+        .model-info {
+            background: rgba(248, 248, 248, 0.8);
+            padding: 16px;
+            border-radius: 12px;
+            margin-top: 16px;
+            backdrop-filter: blur(10px);
+        }
+
+        .info-section {
+            margin-bottom: 12px;
+        }
+
+        .info-section h3 {
+            color: #1d1d1f;
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+            letter-spacing: -0.01em;
+        }
+
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+        }
+
+        .info-label {
+            font-weight: 500;
+            color: #1d1d1f;
+        }
+
+        .info-value {
+            color: #86868b;
+            font-family: 'SF Mono', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+        }
+
+        .status-message {
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin: 12px 0;
+            display: none;
+            font-weight: 500;
+        }
+
+        .status-message.success {
+            background: rgba(40, 205, 65, 0.1);
+            color: #1fa334;
+            border: 1px solid rgba(40, 205, 65, 0.2);
+        }
+
+        .status-message.error {
+            background: rgba(255, 59, 48, 0.1);
+            color: #cc2e24;
+            border: 1px solid rgba(255, 59, 48, 0.2);
+        }
+
+        .status-message.info {
+            background: rgba(0, 122, 255, 0.1);
+            color: #007aff;
+            border: 1px solid rgba(0, 122, 255, 0.2);
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .spinner {
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-top: 3px solid #007aff;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .node-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .node-stat {
+            background: rgba(255, 255, 255, 0.8);
+            padding: 12px;
+            border-radius: 8px;
+            border-left: 3px solid #007aff;
+            backdrop-filter: blur(10px);
+        }
+
+        .node-stat .count {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1d1d1f;
+            margin-bottom: 2px;
+        }
+
+        .node-stat .label {
+            font-size: 0.75rem;
+            color: #86868b;
+            font-weight: 500;
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .nodes-list {
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 12px;
+        }
+
+        .node-item {
+            background: rgba(255, 255, 255, 0.8);
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            border-left: 3px solid #007aff;
+            backdrop-filter: blur(10px);
+        }
+
+        .node-item .node-type {
+            font-weight: 600;
+            color: #1d1d1f;
+            font-size: 1rem;
+        }
+
+        @media (max-width: 1024px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .header h1 {
+                font-size: 2.5rem;
+            }
+            
+            .card {
+                padding: 32px 24px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .header {
+                padding: 60px 0 40px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .header p {
+                font-size: 1.125rem;
+            }
+            
+            .card {
+                padding: 24px 20px;
+            }
+            
+            .upload-area {
+                padding: 40px 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔄 ONNX2TFLite 模型转换工具</h1>
+            <p>轻松将 ONNX 模型转换为 TensorFlow Lite 格式</p>
+        </div>
+
+        <div class="main-content">
+            <div class="card">
+                <h2>📤 上传模型</h2>
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📁</div>
+                    <p style="font-size: 1rem; font-weight: 600; margin-bottom: 4px; color: #1d1d1f;"><strong>点击或拖拽上传 ONNX 模型</strong></p>
+                    <p style="color: #86868b; font-size: 0.875rem;">支持 .onnx 格式，最大 500MB</p>
+                    <input type="file" id="fileInput" accept=".onnx">
+                </div>
+
+                <div class="status-message" id="statusMessage"></div>
+
+                <div class="options" id="conversionOptions" style="display: none;">
+                    <h3 style="color: #1d1d1f; margin-bottom: 12px; font-weight: 600;">转换选项</h3>
+                    <div class="option-item">
+                        <input type="checkbox" id="allowInputsStripping">
+                        <label for="allowInputsStripping">允许移除不必要的输入</label>
+                    </div>
+                    <div class="option-item">
+                        <input type="checkbox" id="keepIoFormat">
+                        <label for="keepIoFormat">保持输入输出格式 (NCHW)</label>
+                    </div>
+                    <div class="option-item">
+                        <input type="checkbox" id="qdqAware">
+                        <label for="qdqAware">QDQ 感知转换</label>
+                    </div>
+                    <div class="option-item">
+                        <input type="checkbox" id="enableQuantization">
+                        <label for="enableQuantization">🔥 启用量化 (减小模型大小)</label>
+                    </div>
+                </div>
+
+                <div class="options" id="quantizationOptions" style="display: none;">
+                    <h3 style="color: #1d1d1f; margin-bottom: 12px; font-weight: 600;">🎯 量化配置</h3>
+                    <p style="color: #86868b; font-size: 0.875rem; margin-bottom: 16px;">选择要量化的层类型。使用真实校准数据可以显著提高量化精度。</p>
+                    
+                    <!-- 校准数据上传区域 -->
+                    <div class="calibration-upload-section" style="margin-bottom: 20px; padding: 16px; background: rgba(0, 122, 255, 0.05); border-radius: 8px; border: 1px solid rgba(0, 122, 255, 0.2);">
+                        <h4 style="color: #007aff; margin-bottom: 8px; font-weight: 600; font-size: 1rem;">📦 校准数据 (可选但推荐)</h4>
+                        <p style="color: #86868b; font-size: 0.8rem; margin-bottom: 12px;">
+                            上传包含.npy文件的ZIP包作为校准数据，可显著提高量化精度。不上传将使用随机数据。
+                        </p>
+                        
+                        <div class="calibration-upload-area" id="calibrationUploadArea" style="border: 2px dashed #007aff; border-radius: 8px; padding: 16px; text-align: center; background: rgba(255, 255, 255, 0.8); cursor: pointer; transition: all 0.3s;">
+                            <div class="upload-icon" style="font-size: 24px; margin-bottom: 8px;">📁</div>
+                            <p style="margin: 0; color: #007aff; font-weight: 500;">点击或拖拽上传校准数据ZIP文件</p>
+                            <p style="margin: 4px 0 0; color: #86868b; font-size: 0.75rem;">支持包含多个.npy文件的ZIP包</p>
+                            <input type="file" id="calibrationFileInput" accept=".zip" style="display: none;">
+                        </div>
+                        
+                        <div id="calibrationFileInfo" style="margin-top: 12px; display: none;">
+                            <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: rgba(52, 199, 89, 0.1); border-radius: 6px; border: 1px solid rgba(52, 199, 89, 0.3);">
+                                <div style="display: flex; align-items: center;">
+                                    <span style="color: #34c759; margin-right: 8px;">✓</span>
+                                    <span id="calibrationFileName" style="color: #1d1d1f; font-weight: 500;"></span>
+                                    <span id="calibrationFileCount" style="color: #86868b; margin-left: 8px; font-size: 0.875rem;"></span>
+                                </div>
+                                <button id="removeCalibritionFile" style="background: none; border: none; color: #ff3b30; cursor: pointer; font-size: 16px; padding: 4px;">×</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 层选择区域 -->
+                    <div class="layer-selection-section">
+                        <h4 style="color: #1d1d1f; margin-bottom: 12px; font-weight: 600;">🔧 量化层选择</h4>
+                        <div class="option-item">
+                            <input type="checkbox" id="quantAll" checked>
+                            <label for="quantAll"><strong>全选/全不选</strong></label>
+                        </div>
+                        
+                        <div style="border-top: 1px solid rgba(0,0,0,0.1); margin: 12px 0; padding-top: 12px;">
+                            <div class="layer-selection-grid" id="layerSelectionGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 8px;">
+                                <!-- Layer selection checkboxes will be dynamically added here -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="text-align: center; margin-top: 20px;">
+                    <button class="btn btn-success" id="convertBtn" style="display: none;">
+                        🔄 开始转换
+                    </button>
+                    <button class="btn btn-download" id="downloadBtn" style="display: none;">
+                        ⬇️ 下载 TFLite 模型
+                    </button>
+                    <button class="btn btn-download" id="downloadQuantizedBtn" style="display: none; background: #ff9500;">
+                        🔥 下载量化 TFLite 模型
+                    </button>
+                    <button class="btn" id="convertToCppBtn" style="display: none; background: #34c759;">
+                        🏠 转C++文件
+                    </button>
+                    <button class="btn" id="convertQuantizedToCppBtn" style="display: none; background: #34c759;">
+                        🏠 量化模型转C++
+                    </button>
+                    <button class="btn btn-download" id="downloadCppBtn" style="display: none; background: #5ac8fa;">
+                        📺 下载C++文件
+                    </button>
+                    <button class="btn btn-download" id="downloadQuantizedCppBtn" style="display: none; background: #5ac8fa;">
+                        📺 下载量化C++文件
+                    </button>
+                </div>
+
+                <div class="loading" id="loadingIndicator">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 12px; color: #007aff; font-weight: 500;">处理中，请稍候...</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>📊 模型信息</h2>
+                <div id="modelInfo" style="color: #86868b; text-align: center; padding: 40px 20px; font-size: 1rem;">
+                    上传模型后将显示详细信息
+                </div>
+            </div>
+        </div>
+
+        <div class="card full-width" id="detailedInfo" style="display: none;">
+            <h2>🔍 详细结构</h2>
+            <div id="detailedContent"></div>
+        </div>
+        
+        <div class="card full-width" id="conversionReport" style="display: none;">
+            <h2>📋 转换报告</h2>
+            <div id="reportContent"></div>
+        </div>
+    </div>
+
+    <script>
+        let uploadedFilename = null;
+        let tfliteFilename = null;
+        let quantizedTfliteFilename = null;
+        let cppFilename = null;
+        let quantizedCppFilename = null;
+        let calibrationDataFilename = null;
+        let availableLayers = [];
+
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const statusMessage = document.getElementById('statusMessage');
+        const modelInfo = document.getElementById('modelInfo');
+        const convertBtn = document.getElementById('convertBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const downloadQuantizedBtn = document.getElementById('downloadQuantizedBtn');
+        const convertToCppBtn = document.getElementById('convertToCppBtn');
+        const convertQuantizedToCppBtn = document.getElementById('convertQuantizedToCppBtn');
+        const downloadCppBtn = document.getElementById('downloadCppBtn');
+        const downloadQuantizedCppBtn = document.getElementById('downloadQuantizedCppBtn');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const conversionOptions = document.getElementById('conversionOptions');
+        const quantizationOptions = document.getElementById('quantizationOptions');
+        const detailedInfo = document.getElementById('detailedInfo');
+        const conversionReport = document.getElementById('conversionReport');
+        const enableQuantizationCheckbox = document.getElementById('enableQuantization');
+
+        // 校准数据上传相关元素
+        const calibrationUploadArea = document.getElementById('calibrationUploadArea');
+        const calibrationFileInput = document.getElementById('calibrationFileInput');
+        const calibrationFileInfo = document.getElementById('calibrationFileInfo');
+        const calibrationFileName = document.getElementById('calibrationFileName');
+        const calibrationFileCount = document.getElementById('calibrationFileCount');
+        const removeCalibritionFile = document.getElementById('removeCalibritionFile');
+        const quantAllCheckbox = document.getElementById('quantAll');
+        const layerSelectionGrid = document.getElementById('layerSelectionGrid');
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragging');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragging');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragging');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileUpload(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileUpload(e.target.files[0]);
+            }
+        });
+
+        // 校准数据上传事件处理器
+        calibrationUploadArea.addEventListener('click', () => calibrationFileInput.click());
+        
+        // 校准数据拖拽上传支持
+        calibrationUploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            calibrationUploadArea.classList.add('dragging');
+        });
+
+        calibrationUploadArea.addEventListener('dragleave', () => {
+            calibrationUploadArea.classList.remove('dragging');
+        });
+
+        calibrationUploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            calibrationUploadArea.classList.remove('dragging');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleCalibrationDataUpload(files[0]);
+            }
+        });
+        
+        calibrationFileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleCalibrationDataUpload(e.target.files[0]);
+            }
+        });
+
+        removeCalibritionFile.addEventListener('click', () => {
+            calibrationDataFilename = null;
+            calibrationFileInfo.style.display = 'none';
+            calibrationUploadArea.style.display = 'block';
+        });
+
+        async function handleCalibrationDataUpload(file) {
+            if (!file.name.toLowerCase().endsWith('.zip')) {
+                alert('请上传 .zip 格式的校准数据文件');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            loadingIndicator.style.display = 'block';
+            showStatus('上传校准数据中...', 'info');
+
+            try {
+                const response = await fetch('/upload_calibration_data', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    calibrationDataFilename = data.filename;
+                    calibrationFileName.textContent = file.name;
+                    calibrationFileCount.textContent = `(${data.npy_files_count} 个.npy文件)`;
+                    
+                    calibrationUploadArea.style.display = 'none';
+                    calibrationFileInfo.style.display = 'block';
+                    
+                    showStatus('校准数据上传成功！量化精度将显著提升', 'success');
+                } else {
+                    showStatus(data.error, 'error');
+                }
+            } catch (error) {
+                showStatus('校准数据上传失败: ' + error.message, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+            }
+        }
+
+        async function handleFileUpload(file) {
+            if (!file.name.endsWith('.onnx')) {
+                showStatus('请上传 .onnx 格式的文件', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            loadingIndicator.style.display = 'block';
+            showStatus('上传中...', 'info');
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    uploadedFilename = data.filename;
+                    showStatus('✅ 文件上传成功！', 'success');
+                    displayModelInfo(data.model_info);
+                    convertBtn.style.display = 'inline-block';
+                    conversionOptions.style.display = 'block';
+                    downloadBtn.style.display = 'none';
+                    downloadQuantizedBtn.style.display = 'none';
+                    convertToCppBtn.style.display = 'none';
+                    convertQuantizedToCppBtn.style.display = 'none';
+                    downloadCppBtn.style.display = 'none';
+                    downloadQuantizedCppBtn.style.display = 'none';
+                    // 重置文件名变量
+                    tfliteFilename = null;
+                    quantizedTfliteFilename = null;
+                    cppFilename = null;
+                    quantizedCppFilename = null;
+                } else {
+                    showStatus('❌ ' + (data.error || '上传失败'), 'error');
+                }
+            } catch (error) {
+                showStatus('❌ 上传出错: ' + error.message, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+            }
+        }
+
+        function displayModelInfo(info) {
+            if (info.error) {
+                modelInfo.innerHTML = `<div style="color: red;">错误: ${info.error}</div>`;
+                return;
+            }
+
+            let html = '<div class="model-info">';
+            
+            html += '<div class="info-section"><h3>基本信息</h3>';
+            html += `<div class="info-item"><span class="info-label">IR 版本:</span><span class="info-value">${info.ir_version}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">生产者:</span><span class="info-value">${info.producer_name || 'N/A'} ${info.producer_version || ''}</span></div>`;
+            
+            if (info.opset_imports && info.opset_imports.length > 0) {
+                const opsets = info.opset_imports.map(op => `${op.domain}: v${op.version}`).join(', ');
+                html += `<div class="info-item"><span class="info-label">Opset:</span><span class="info-value">${opsets}</span></div>`;
+            }
+            html += '</div>';
+
+            html += '<div class="info-section"><h3>输入</h3>';
+            info.inputs.forEach(inp => {
+                html += `<div class="info-item"><span class="info-label">${inp.name}:</span><span class="info-value">[${inp.shape.join(', ')}]</span></div>`;
+            });
+            html += '</div>';
+
+            html += '<div class="info-section"><h3>输出</h3>';
+            info.outputs.forEach(out => {
+                html += `<div class="info-item"><span class="info-label">${out.name}:</span><span class="info-value">[${out.shape.join(', ')}]</span></div>`;
+            });
+            html += '</div>';
+
+            html += '<div class="info-section"><h3>模型统计</h3>';
+            html += `<div class="info-item"><span class="info-label">总节点数:</span><span class="info-value">${info.total_nodes}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">初始化器:</span><span class="info-value">${info.total_initializers}</span></div>`;
+            html += '</div>';
+
+            if (info.node_types) {
+                html += '<div class="info-section"><h3>算子类型统计</h3>';
+                html += '<div class="node-stats">';
+                for (const [opType, count] of Object.entries(info.node_types)) {
+                    html += `<div class="node-stat"><div class="count">${count}</div><div class="label">${opType}</div></div>`;
+                }
+                html += '</div></div>';
+            }
+
+            html += '</div>';
+            modelInfo.innerHTML = html;
+
+            // Update available layers for quantization
+            if (info.node_types) {
+                updateAvailableLayers(info.node_types);
+            }
+
+            if (info.nodes && info.nodes.length > 0) {
+                displayDetailedNodes(info.nodes, info.nodes_truncated, info.total_nodes_count);
+            }
+        }
+
+        function displayDetailedNodes(nodes, truncated, totalCount) {
+            detailedInfo.style.display = 'block';
+            let html = '<div class="nodes-list">';
+            
+            if (truncated) {
+                html += `<p style="color: #007aff; margin-bottom: 12px; font-weight: 500;">显示前 ${nodes.length} 个节点（共 ${totalCount} 个）</p>`;
+            }
+            
+            nodes.forEach(node => {
+                html += `<div class="node-item">`;
+                html += `<div><span class="node-type">${node.op_type}</span> - ${node.name}</div>`;
+                html += `<div style="font-size: 0.75rem; color: #86868b; margin-top: 4px;">`;
+                html += `输入: ${node.inputs.join(', ')}<br>`;
+                html += `输出: ${node.outputs.join(', ')}`;
+                html += `</div></div>`;
+            });
+            
+            html += '</div>';
+            document.getElementById('detailedContent').innerHTML = html;
+        }
+
+        convertBtn.addEventListener('click', async () => {
+            if (!uploadedFilename) {
+                showStatus('请先上传模型', 'error');
+                return;
+            }
+
+            const options = {
+                allow_inputs_stripping: document.getElementById('allowInputsStripping').checked,
+                keep_io_format: document.getElementById('keepIoFormat').checked,
+                qdq_aware_conversion: document.getElementById('qdqAware').checked
+            };
+
+            const enableQuantization = enableQuantizationCheckbox.checked;
+
+            loadingIndicator.style.display = 'block';
+            showStatus('正在转换模型，请稍候...', 'info');
+            convertBtn.disabled = true;
+            downloadBtn.style.display = 'none';
+            downloadQuantizedBtn.style.display = 'none';
+            convertToCppBtn.style.display = 'none';
+            convertQuantizedToCppBtn.style.display = 'none';
+            downloadCppBtn.style.display = 'none';
+            downloadQuantizedCppBtn.style.display = 'none';
+
+            try {
+                // Regular conversion
+                const response = await fetch('/convert', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filename: uploadedFilename,
+                        options: options
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    tfliteFilename = data.tflite_filename;
+                    
+                    // 保存转换数据供精度对比使用
+                    currentConversionData = {
+                        tflite_filename: data.tflite_filename,
+                        quantized_tflite_filename: null
+                    };
+                    
+                    const sizeInfo = `ONNX: ${(data.onnx_size / 1024 / 1024).toFixed(2)} MB → TFLite: ${(data.tflite_size / 1024 / 1024).toFixed(2)} MB (压缩 ${data.compression_ratio})`;
+                    showStatus('✅ 基础转换成功！' + sizeInfo, 'success');
+                    downloadBtn.style.display = 'inline-block';
+                    convertToCppBtn.style.display = 'inline-block';
+                    
+                    // 显示转换报告
+                    if (data.conversion_report) {
+                        displayConversionReport(data.conversion_report);
+                    }
+
+                    // Perform quantization if enabled
+                    if (enableQuantization) {
+                        await performQuantization();
+                    }
+                } else {
+                    showStatus('❌ 转换失败: ' + (data.error || '未知错误'), 'error');
+                }
+            } catch (error) {
+                showStatus('❌ 转换出错: ' + error.message, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+                convertBtn.disabled = false;
+            }
+        });
+
+        async function performQuantization() {
+            try {
+                if (calibrationDataFilename) {
+                    showStatus('🔥 正在使用真实数据进行量化处理...', 'info');
+                } else {
+                    showStatus('🔥 正在使用随机数据进行量化处理...', 'info');
+                }
+                
+                // Get selected layers
+                const selectedLayers = [];
+                const layerCheckboxes = document.querySelectorAll('#layerSelectionGrid input[type="checkbox"]:checked');
+                layerCheckboxes.forEach(checkbox => {
+                    selectedLayers.push(checkbox.value);
+                });
+
+                const requestBody = {
+                    filename: uploadedFilename,
+                    selected_layers: selectedLayers
+                };
+                
+                // 如果有校准数据文件，添加到请求中
+                if (calibrationDataFilename) {
+                    requestBody.calibration_data_filename = calibrationDataFilename;
+                }
+
+                const quantResponse = await fetch('/quantize', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                const quantData = await quantResponse.json();
+
+                if (quantData.success) {
+                    quantizedTfliteFilename = quantData.quantized_tflite_filename;
+                    
+                    // 更新转换数据，添加量化模型文件名
+                    if (currentConversionData) {
+                        currentConversionData.quantized_tflite_filename = quantData.quantized_tflite_filename;
+                    }
+                    
+                    const quantSizeInfo = `量化后: ${(quantData.quantized_tflite_size / 1024 / 1024).toFixed(2)} MB (额外压缩 ${quantData.additional_compression_ratio})`;
+                    const dataSourceInfo = calibrationDataFilename ? ' (使用真实校准数据)' : ' (使用随机校准数据)';
+                    showStatus('🔥 量化成功！' + quantSizeInfo + dataSourceInfo, 'success');
+                    downloadQuantizedBtn.style.display = 'inline-block';
+                    convertQuantizedToCppBtn.style.display = 'inline-block';
+                    
+                    // 显示量化报告
+                    if (quantData.quantization_report) {
+                        displayQuantizationReport(quantData.quantization_report);
+                    }
+                } else {
+                    showStatus('❌ 量化失败: ' + (quantData.error || '未知错误'), 'error');
+                }
+            } catch (error) {
+                showStatus('❌ 量化出错: ' + error.message, 'error');
+            }
+        }
+
+        downloadBtn.addEventListener('click', () => {
+            if (tfliteFilename) {
+                window.location.href = `/download/${tfliteFilename}`;
+            }
+        });
+
+        downloadQuantizedBtn.addEventListener('click', () => {
+            if (quantizedTfliteFilename) {
+                window.location.href = `/download/${quantizedTfliteFilename}`;
+            }
+        });
+
+        // C++转换按钮事件
+        convertToCppBtn.addEventListener('click', async () => {
+            if (!tfliteFilename) {
+                showStatus('❌ 未找到TFLite模型文件', 'error');
+                return;
+            }
+
+            try {
+                loadingIndicator.style.display = 'block';
+                showStatus('🔄 正在转换TFLite模型为C++文件...', 'info');
+
+                const response = await fetch('/convert_to_cpp', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        tflite_filename: tfliteFilename
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    cppFilename = result.cpp_filename;
+                    showStatus('✅ ' + result.message, 'success');
+                    downloadCppBtn.style.display = 'inline-block';
+                } else {
+                    showStatus('❌ C++转换失败: ' + result.error, 'error');
+                }
+            } catch (error) {
+                showStatus('❌ C++转换出错: ' + error.message, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+            }
+        });
+
+        // 量化模型C++转换按钮事件
+        convertQuantizedToCppBtn.addEventListener('click', async () => {
+            if (!quantizedTfliteFilename) {
+                showStatus('❌ 未找到量化TFLite模型文件', 'error');
+                return;
+            }
+
+            try {
+                loadingIndicator.style.display = 'block';
+                showStatus('🔄 正在转换量化TFLite模型为C++文件...', 'info');
+
+                const response = await fetch('/convert_to_cpp', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        tflite_filename: quantizedTfliteFilename
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    quantizedCppFilename = result.cpp_filename;
+                    showStatus('✅ ' + result.message, 'success');
+                    downloadQuantizedCppBtn.style.display = 'inline-block';
+                } else {
+                    showStatus('❌ 量化模型C++转换失败: ' + result.error, 'error');
+                }
+            } catch (error) {
+                showStatus('❌ 量化模型C++转换出错: ' + error.message, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+            }
+        });
+
+        // C++文件下载按钮事件
+        downloadCppBtn.addEventListener('click', () => {
+            if (cppFilename) {
+                window.location.href = `/download/${cppFilename}`;
+            }
+        });
+
+        // 量化模型C++文件下载按钮事件
+        downloadQuantizedCppBtn.addEventListener('click', () => {
+            if (quantizedCppFilename) {
+                window.location.href = `/download/${quantizedCppFilename}`;
+            }
+        });
+
+        // Enable/disable quantization options
+        enableQuantizationCheckbox.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                quantizationOptions.style.display = 'block';
+                populateLayerSelection();
+            } else {
+                quantizationOptions.style.display = 'none';
+            }
+        });
+
+        // Select all/none layers for quantization
+        quantAllCheckbox.addEventListener('change', (e) => {
+            const layerCheckboxes = document.querySelectorAll('#layerSelectionGrid input[type="checkbox"]');
+            layerCheckboxes.forEach(checkbox => {
+                checkbox.checked = e.target.checked;
+            });
+        });
+
+        function populateLayerSelection() {
+            if (availableLayers.length === 0) return;
+            
+            layerSelectionGrid.innerHTML = '';
+            
+            availableLayers.forEach(layer => {
+                const div = document.createElement('div');
+                div.className = 'option-item';
+                div.innerHTML = `
+                    <input type="checkbox" id="layer_${layer}" value="${layer}" checked>
+                    <label for="layer_${layer}">${layer}</label>
+                `;
+                layerSelectionGrid.appendChild(div);
+            });
+        }
+
+        function updateAvailableLayers(nodeTypes) {
+            // Define quantizable layer types based on the QDQQuantizer default_op_types_to_quantize
+            const quantizableOps = [
+                'Add', 'ArgMax', 'ArgMin', 'AveragePool', 'Clip', 'Concat', 'Conv', 'ConvTranspose',
+                'Equal', 'Expand', 'Flatten', 'Gather', 'GatherND', 'Gemm', 'GlobalAveragePool',
+                'GlobalMaxPool', 'Greater', 'GreaterOrEqual', 'HardSwish', 'LeakyRelu', 'Less',
+                'LessOrEqual', 'LogSoftmax', 'MatMul', 'Max', 'MaxPool', 'Min', 'Mul', 'Pad',
+                'PRelu', 'ReduceProd', 'ReduceSum', 'Relu', 'Reshape', 'ScatterND', 'Sigmoid',
+                'Softmax', 'Split', 'Squeeze', 'Sub', 'Tanh', 'Transpose', 'Unsqueeze', 'Where'
+            ];
+            
+            availableLayers = Object.keys(nodeTypes).filter(opType => 
+                quantizableOps.includes(opType)
+            ).sort();
+        }
+
+        function displayConversionReport(report) {
+            conversionReport.style.display = 'block';
+            
+            let html = '<div class="model-info">';
+            
+            // 基本转换信息
+            html += '<div class="info-section"><h3>🔄 转换概要</h3>';
+            html += `<div class="info-item"><span class="info-label">转换状态:</span><span class="info-value" style="color: #28cd41; font-weight: 600;">${report.status}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">转换时间:</span><span class="info-value">${report.conversion_time}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">源格式:</span><span class="info-value">${report.original_format}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">目标格式:</span><span class="info-value">${report.target_format}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">转换时间:</span><span class="info-value">${report.timestamp}</span></div>`;
+            html += '</div>';
+            
+            // 文件大小对比
+            html += '<div class="info-section"><h3>📊 文件大小对比</h3>';
+            html += `<div class="info-item"><span class="info-label">原始文件 (ONNX):</span><span class="info-value">${report.file_sizes.onnx_size_mb}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">转换后 (TFLite):</span><span class="info-value">${report.file_sizes.tflite_size_mb}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">压缩比例:</span><span class="info-value" style="color: #28cd41; font-weight: 600;">${report.file_sizes.compression_ratio}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">节省空间:</span><span class="info-value" style="color: #28cd41;">${report.file_sizes.size_reduction}</span></div>`;
+            html += '</div>';
+            
+            // 精度对比部分
+            html += '<div class="info-section"><h3>🎯 模型精度对比</h3>';
+            html += '<div id="accuracySection">';
+            if (report.accuracy_comparison) {
+                html += renderAccuracyComparison(report.accuracy_comparison);
+            } else {
+                html += `<div class="info-item">
+                    <button id="runAccuracyTest" onclick="runAccuracyComparison()" 
+                            style="background: #007aff; color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-size: 14px;">
+                        🔬 运行精度对比测试 (100组随机数据)
+                    </button>
+                </div>`;
+            }
+            html += '</div></div>';
+            
+            // 模型结构信息
+            html += '<div class="info-section"><h3>🏗️ 模型结构</h3>';
+            html += `<div class="info-item"><span class="info-label">总节点数:</span><span class="info-value">${report.model_structure.total_nodes}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">初始化器:</span><span class="info-value">${report.model_structure.total_initializers}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">输入张量:</span><span class="info-value">${report.model_structure.input_tensors}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">输出张量:</span><span class="info-value">${report.model_structure.output_tensors}</span></div>`;
+            html += '</div>';
+            
+            // 算子类型统计
+            if (Object.keys(report.model_structure.node_types).length > 0) {
+                html += '<div class="info-section"><h3>⚙️ 算子类型分布</h3>';
+                html += '<div class="node-stats">';
+                const sortedNodeTypes = Object.entries(report.model_structure.node_types)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 12); // 只显示前12个最常用的算子
+                
+                for (const [opType, count] of sortedNodeTypes) {
+                    const percentage = ((count / report.model_structure.total_nodes) * 100).toFixed(1);
+                    html += `<div class="node-stat">`;
+                    html += `<div class="count">${count}</div>`;
+                    html += `<div class="label">${opType}</div>`;
+                    html += `<div style="font-size: 0.7rem; color: #86868b; margin-top: 2px;">${percentage}%</div>`;
+                    html += `</div>`;
+                }
+                html += '</div></div>';
+            }
+            
+            // 转换选项
+            if (Object.keys(report.conversion_options).length > 0) {
+                html += '<div class="info-section"><h3>⚙️ 转换选项</h3>';
+                for (const [key, value] of Object.entries(report.conversion_options)) {
+                    const displayKey = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                    const displayValue = value ? '✅ 已启用' : '❌ 已禁用';
+                    const valueColor = value ? '#28cd41' : '#86868b';
+                    html += `<div class="info-item"><span class="info-label">${displayKey}:</span><span class="info-value" style="color: ${valueColor};">${displayValue}</span></div>`;
+                }
+                html += '</div>';
+            }
+            
+            html += '</div>';
+            
+            document.getElementById('reportContent').innerHTML = html;
+        }
+        
+        // 全局变量存储当前转换结果
+        let currentConversionData = null;
+        
+        function runAccuracyComparison() {
+            if (!currentConversionData || !uploadedFilename) {
+                showStatus('无法运行精度测试：缺少必要的文件信息', 'error');
+                return;
+            }
+            
+            const button = document.getElementById('runAccuracyTest');
+            if (button) {
+                button.innerHTML = '🔄 正在运行精度测试...';
+                button.disabled = true;
+            }
+            
+            showStatus('🔬 正在生成100组随机数据并进行模型推理...', 'info');
+            
+            const requestData = {
+                filename: uploadedFilename,
+                tflite_filename: currentConversionData.tflite_filename,
+                quantized_tflite_filename: currentConversionData.quantized_tflite_filename || null,
+                num_samples: 100
+            };
+            
+            fetch('/accuracy_comparison', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestData)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (button) {
+                    button.disabled = false;
+                }
+                
+                if (data.success) {
+                    showStatus('✅ 精度测试完成', 'success');
+                    // 更新精度对比部分
+                    const accuracySection = document.getElementById('accuracySection');
+                    if (accuracySection) {
+                        accuracySection.innerHTML = renderAccuracyComparison(data.accuracy_report);
+                    }
+                } else {
+                    showStatus('❌ 精度测试失败: ' + (data.error || '未知错误'), 'error');
+                    if (button) {
+                        button.innerHTML = '🔬 运行精度对比测试 (100组随机数据)';
+                    }
+                }
+            })
+            .catch(error => {
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = '🔬 运行精度对比测试 (100组随机数据)';
+                }
+                showStatus('❌ 精度测试出错: ' + error.message, 'error');
+            });
+        }
+        
+        function renderAccuracyComparison(accuracyReport) {
+            let html = '';
+            
+            // 测试参数
+            html += '<div style="background: rgba(0, 122, 255, 0.05); padding: 16px; border-radius: 8px; margin: 8px 0;">';
+            html += '<h4 style="margin: 0 0 8px 0; color: #007aff;">📊 测试参数</h4>';
+            html += `<div class="info-item"><span class="info-label">测试样本数:</span><span class="info-value">${accuracyReport.test_parameters.num_samples}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">测试时间:</span><span class="info-value">${accuracyReport.test_parameters.comparison_time}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">成功对比数:</span><span class="info-value">${accuracyReport.accuracy_metrics.successful_samples}</span></div>`;
+            html += '</div>';
+            
+            // ONNX vs TFLite 对比结果
+            if (accuracyReport.accuracy_metrics.onnx_vs_tflite && Object.keys(accuracyReport.accuracy_metrics.onnx_vs_tflite).length > 0) {
+                const tfliteMetrics = accuracyReport.accuracy_metrics.onnx_vs_tflite;
+                html += '<div style="background: rgba(40, 205, 65, 0.05); padding: 16px; border-radius: 8px; margin: 8px 0;">';
+                html += '<h4 style="margin: 0 0 8px 0; color: #28cd41;">🟢 ONNX vs TFLite 精度对比</h4>';
+                html += `<div class="info-item"><span class="info-label">平均相对误差:</span><span class="info-value">${(tfliteMetrics.mean_relative_error * 100).toFixed(4)}%</span></div>`;
+                html += `<div class="info-item"><span class="info-label">最大相对误差:</span><span class="info-value">${(tfliteMetrics.max_relative_error * 100).toFixed(4)}%</span></div>`;
+                html += `<div class="info-item"><span class="info-label">平均绝对误差 (MAE):</span><span class="info-value">${tfliteMetrics.mean_mae.toFixed(6)}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">最大绝对误差:</span><span class="info-value">${tfliteMetrics.max_max_error.toFixed(6)}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">均方误差 (MSE):</span><span class="info-value">${tfliteMetrics.mean_mse.toFixed(8)}</span></div>`;
+                html += '</div>';
+            }
+            
+            // ONNX vs 量化TFLite 对比结果
+            if (accuracyReport.accuracy_metrics.onnx_vs_quantized_tflite && Object.keys(accuracyReport.accuracy_metrics.onnx_vs_quantized_tflite).length > 0) {
+                const quantizedMetrics = accuracyReport.accuracy_metrics.onnx_vs_quantized_tflite;
+                html += '<div style="background: rgba(255, 149, 0, 0.05); padding: 16px; border-radius: 8px; margin: 8px 0;">';
+                html += '<h4 style="margin: 0 0 8px 0; color: #ff9500;">🟠 ONNX vs 量化TFLite 精度对比</h4>';
+                html += `<div class="info-item"><span class="info-label">平均相对误差:</span><span class="info-value">${(quantizedMetrics.mean_relative_error * 100).toFixed(4)}%</span></div>`;
+                html += `<div class="info-item"><span class="info-label">最大相对误差:</span><span class="info-value">${(quantizedMetrics.max_relative_error * 100).toFixed(4)}%</span></div>`;
+                html += `<div class="info-item"><span class="info-label">平均绝对误差 (MAE):</span><span class="info-value">${quantizedMetrics.mean_mae.toFixed(6)}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">最大绝对误差:</span><span class="info-value">${quantizedMetrics.max_max_error.toFixed(6)}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">均方误差 (MSE):</span><span class="info-value">${quantizedMetrics.mean_mse.toFixed(8)}</span></div>`;
+                html += '</div>';
+            }
+            
+            // 推理结果统计
+            html += '<div style="background: rgba(142, 142, 147, 0.05); padding: 16px; border-radius: 8px; margin: 8px 0;">';
+            html += '<h4 style="margin: 0 0 8px 0; color: #8e8e93;">📈 推理结果统计</h4>';
+            html += `<div class="info-item"><span class="info-label">ONNX成功推理:</span><span class="info-value">${accuracyReport.inference_results.onnx_successful_inferences}/${accuracyReport.test_parameters.num_samples}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">TFLite成功推理:</span><span class="info-value">${accuracyReport.inference_results.tflite_successful_inferences}/${accuracyReport.test_parameters.num_samples}</span></div>`;
+            if (accuracyReport.inference_results.quantized_tflite_successful_inferences > 0) {
+                html += `<div class="info-item"><span class="info-label">量化TFLite成功推理:</span><span class="info-value">${accuracyReport.inference_results.quantized_tflite_successful_inferences}/${accuracyReport.test_parameters.num_samples}</span></div>`;
+            }
+            html += '</div>';
+            
+            // 精度评估结论
+            html += '<div style="background: rgba(0, 122, 255, 0.1); padding: 16px; border-radius: 8px; margin: 8px 0; border-left: 4px solid #007aff;">';
+            html += '<h4 style="margin: 0 0 8px 0; color: #007aff;">🎯 精度评估结论</h4>';
+            
+            if (accuracyReport.accuracy_metrics.onnx_vs_tflite) {
+                const tfliteError = accuracyReport.accuracy_metrics.onnx_vs_tflite.mean_relative_error;
+                const tfliteAssessment = tfliteError < 0.001 ? '🟢 非常优秀' : 
+                                       tfliteError < 0.01 ? '🟡 良好' : '🔴 需要注意';
+                html += `<div class="info-item"><span class="info-label">TFLite转换精度:</span><span class="info-value">${tfliteAssessment} (${(tfliteError * 100).toFixed(4)}%)</span></div>`;
+            }
+            
+            if (accuracyReport.accuracy_metrics.onnx_vs_quantized_tflite) {
+                const quantError = accuracyReport.accuracy_metrics.onnx_vs_quantized_tflite.mean_relative_error;
+                const quantAssessment = quantError < 0.01 ? '🟢 非常优秀' : 
+                                      quantError < 0.05 ? '🟡 良好' : '🔴 需要注意';
+                html += `<div class="info-item"><span class="info-label">量化精度:</span><span class="info-value">${quantAssessment} (${(quantError * 100).toFixed(4)}%)</span></div>`;
+            }
+            
+            html += '</div>';
+            
+            return html;
+        }
+
+        function displayQuantizationReport(report) {
+            // 追加量化报告到现有的转换报告中
+            const reportContent = document.getElementById('reportContent');
+            if (!reportContent) return;
+            
+            let html = '<div class="info-section" style="border-top: 2px solid #ff9500; margin-top: 20px; padding-top: 20px;"><h3>🔥 量化处理报告</h3>';
+            
+            // 量化概要
+            html += `<div class="info-item"><span class="info-label">量化状态:</span><span class="info-value" style="color: #ff9500; font-weight: 600;">${report.status}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">量化时间:</span><span class="info-value">${report.quantization_time}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">量化方法:</span><span class="info-value">${report.quantization_method}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">量化层类型:</span><span class="info-value">${report.quantized_layer_types.join(', ')}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">处理时间:</span><span class="info-value">${report.timestamp}</span></div>`;
+            
+            // 校准数据验证报告
+            if (report.calibration_data_validation) {
+                const validation = report.calibration_data_validation;
+                html += '<h4 style="margin: 16px 0 8px 0; color: #007acc;">📋 校准数据验证报告</h4>';
+                
+                // 验证统计
+                html += `<div class="info-item"><span class="info-label">总文件数:</span><span class="info-value">${validation.total_files}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">有效文件:</span><span class="info-value" style="color: green;">${validation.valid_files}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">无效文件:</span><span class="info-value" style="color: red;">${validation.invalid_files}</span></div>`;
+                html += `<div class="info-item"><span class="info-label">成功加载样本:</span><span class="info-value" style="color: green; font-weight: 600;">${validation.loaded_samples}</span></div>`;
+                
+                // 期望的输入规格
+                if (validation.expected_specs) {
+                    html += '<div style="margin: 12px 0;"><strong>期望输入规格 (batch=1):</strong></div>';
+                    for (const [inputName, specs] of Object.entries(validation.expected_specs)) {
+                        html += `<div class="info-item" style="margin-left: 20px;">
+                            <span class="info-label">${inputName}:</span>
+                            <span class="info-value">shape=${JSON.stringify(specs.shape)}, dtype=${specs.dtype.name || specs.dtype}</span>
+                        </div>`;
+                    }
+                }
+                
+                // 验证错误信息
+                if (validation.validation_errors && validation.validation_errors.length > 0) {
+                    html += '<div style="margin: 12px 0;"><strong style="color: red;">验证错误:</strong></div>';
+                    const errorsToShow = validation.validation_errors.slice(0, 5); // 显示前5个错误
+                    for (const error of errorsToShow) {
+                        html += `<div style="margin-left: 20px; color: red; font-size: 0.9em;">• ${error}</div>`;
+                    }
+                    if (validation.validation_errors.length > 5) {
+                        html += `<div style="margin-left: 20px; color: red; font-size: 0.9em;">... 还有 ${validation.validation_errors.length - 5} 个错误</div>`;
+                    }
+                }
+                
+                // 文件详细信息（只显示前10个）
+                if (validation.file_details && validation.file_details.length > 0) {
+                    html += '<div style="margin: 12px 0;"><strong>文件验证详情:</strong></div>';
+                    html += '<table style="width: 100%; font-size: 0.9em; border-collapse: collapse;">';
+                    html += '<tr style="background-color: #f5f5f5;"><th style="padding: 5px; border: 1px solid #ddd;">文件名</th><th style="padding: 5px; border: 1px solid #ddd;">状态</th><th style="padding: 5px; border: 1px solid #ddd;">实际形状</th><th style="padding: 5px; border: 1px solid #ddd;">匹配输入</th></tr>';
+                    
+                    const detailsToShow = validation.file_details.slice(0, 10);
+                    for (const detail of detailsToShow) {
+                        const statusColor = detail.status === 'success' ? 'green' : 'red';
+                        const shapeStr = detail.actual_shape ? JSON.stringify(detail.actual_shape) : 'N/A';
+                        const matchedInput = detail.matched_input || 'N/A';
+                        
+                        html += `<tr>
+                            <td style="padding: 5px; border: 1px solid #ddd;">${detail.filename}</td>
+                            <td style="padding: 5px; border: 1px solid #ddd; color: ${statusColor};">${detail.status}</td>
+                            <td style="padding: 5px; border: 1px solid #ddd;">${shapeStr}</td>
+                            <td style="padding: 5px; border: 1px solid #ddd;">${matchedInput}</td>
+                        </tr>`;
+                    }
+                    
+                    html += '</table>';
+                    if (validation.file_details.length > 10) {
+                        html += `<div style="margin: 8px 0; font-size: 0.9em; color: #666;">... 还有 ${validation.file_details.length - 10} 个文件</div>`;
+                    }
+                }
+            }
+            
+            // 量化效果
+            html += '<h4 style="margin: 16px 0 8px 0; color: #ff9500;">📊 量化效果对比</h4>';
+            html += `<div class="info-item"><span class="info-label">原始ONNX:</span><span class="info-value">${report.file_sizes.original_onnx_size_mb}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">量化ONNX:</span><span class="info-value">${report.file_sizes.quantized_onnx_size_mb}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">量化TFLite:</span><span class="info-value">${report.file_sizes.quantized_tflite_size_mb}</span></div>`;
+            html += `<div class="info-item"><span class="info-label">总压缩比:</span><span class="info-value" style="color: #ff9500; font-weight: 600;">${report.file_sizes.additional_compression_ratio}</span></div>`;
+            
+            html += '</div>';
+            
+            // 添加到报告内容末尾
+            reportContent.innerHTML += html;
+        }
+        
+        function showStatus(message, type) {
+            statusMessage.textContent = message;
+            statusMessage.className = `status-message ${type}`;
+            statusMessage.style.display = 'block';
+            
+            if (type === 'success') {
+                setTimeout(() => {
+                    statusMessage.style.display = 'none';
+                }, 5000);
+            }
+        }
+    </script>
+</body>
+</html>
