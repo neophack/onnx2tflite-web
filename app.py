@@ -12,166 +12,306 @@ import threading
 import time
 import glob
 import shutil
-
-# 导入转换器
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'eiq-onnx2tflite'))
-import onnx2tflite.src.converter.convert as convert
-
-# 导入量化相关模块
-from onnx2quant.qdq_quantization import QDQQuantizer, RandomDataCalibrationDataReader, InputSpec
-from onnx2quant.quantization_config import QuantizationConfig
 import numpy as np
+import zipfile
+import tempfile
+import io
+import contextlib
 
-# 导入推理相关模块
-import onnxruntime as ort
-import tensorflow as tf
-from typing import Dict, List, Tuple, Any
+try:
+    import onnxruntime as ort
+    import tensorflow as tf
+    INFERENCE_AVAILABLE = True
+except ImportError:
+    INFERENCE_AVAILABLE = False
+    print("Warning: onnxruntime or tensorflow not available. Accuracy comparison will be disabled.")
 
+# Add eiq-onnx2tflite to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'eiq-onnx2tflite'))
+
+# Import converter
+import onnx2tflite.src.converter.convert as convert
+from onnx2tflite.src.conversion_config import ConversionConfig
+
+# Import quantization modules
+from onnx2quant.qdq_quantization import QDQQuantizer, InputSpec
+from onnx2quant.quantization_config import QuantizationConfig
+
+# We need a custom reader for real data
+class RealDataCalibrationDataReader:
+    def __init__(self, input_data_map):
+        """
+        input_data_map: dict { input_name: [numpy_array_sample_1, numpy_array_sample_2, ...] }
+        """
+        self.input_data_map = input_data_map
+        self.input_names = list(input_data_map.keys())
+        # Assuming all inputs have same number of samples
+        self.num_samples = len(input_data_map[self.input_names[0]])
+        self.current_index = 0
+
+    def get_next(self):
+        if self.current_index < self.num_samples:
+            batch = {}
+            for name in self.input_names:
+                batch[name] = self.input_data_map[name][self.current_index]
+            self.current_index += 1
+            return batch
+        else:
+            return None
+    
+    def rewind(self):
+        self.current_index = 0
+
+def compare_model_accuracy(onnx_path, tflite_path, test_data=None, num_samples=100):
+    """Compare accuracy between ONNX and TFLite models.
+    
+    Args:
+        onnx_path: Path to ONNX model
+        tflite_path: Path to TFLite model
+        test_data: Optional dict {input_name: [arrays]} for calibration data
+        num_samples: Number of random samples to generate if no test_data
+    
+    Returns:
+        dict with accuracy metrics or None if comparison failed
+    """
+    if not INFERENCE_AVAILABLE:
+        return None
+    
+    try:
+        # Load ONNX model
+        ort_session = ort.InferenceSession(onnx_path)
+        onnx_inputs = ort_session.get_inputs()
+        onnx_outputs = ort_session.get_outputs()
+        
+        # Load TFLite model
+        interpreter = tf.lite.Interpreter(model_path=tflite_path)
+        interpreter.allocate_tensors()
+        tflite_inputs = interpreter.get_input_details()
+        tflite_outputs = interpreter.get_output_details()
+        
+        # Generate or use test data
+        if test_data:
+            # Use provided calibration data
+            try:
+                samples_count = min(num_samples, len(list(test_data.values())[0]))
+                test_samples = []
+                for i in range(samples_count):
+                    sample = {}
+                    for name in test_data.keys():
+                        data_array = test_data[name][i]
+                        # Ensure it's a numpy array and float32
+                        if not isinstance(data_array, np.ndarray):
+                            data_array = np.array(data_array)
+                        if data_array.dtype != np.float32:
+                            data_array = data_array.astype(np.float32)
+                        sample[name] = data_array
+                    test_samples.append(sample)
+            except Exception as e:
+                print(f"Error processing calibration data: {e}, falling back to random data")
+                test_data = None
+        
+        if not test_data:
+            # Generate random data
+            test_samples = []
+            for _ in range(num_samples):
+                sample = {}
+                for inp in onnx_inputs:
+                    shape = [d if isinstance(d, int) else 1 for d in inp.shape]
+                    # Handle string dimensions
+                    shape = [s if s > 0 else 1 for s in shape]
+                    sample[inp.name] = np.random.randn(*shape).astype(np.float32)
+                test_samples.append(sample)
+        
+        # Run inference and collect results
+        onnx_results = []
+        tflite_results = []
+        tflite_times = []
+        
+        for sample in test_samples:
+            try:
+                # ONNX inference
+                onnx_feed = {inp.name: sample[inp.name] for inp in onnx_inputs}
+                onnx_out = ort_session.run([out.name for out in onnx_outputs], onnx_feed)
+                
+                # TFLite inference with timing
+                for i, inp_detail in enumerate(tflite_inputs):
+                    inp_name = onnx_inputs[i].name if i < len(onnx_inputs) else list(sample.keys())[i]
+                    input_data = sample[inp_name]
+                    
+                    # Ensure data type matches TFLite expectation
+                    expected_dtype = inp_detail['dtype']
+                    if input_data.dtype != expected_dtype:
+                        input_data = input_data.astype(expected_dtype)
+                    
+                    # Ensure shape matches
+                    expected_shape = inp_detail['shape']
+                    if input_data.shape != tuple(expected_shape):
+                        # Try to reshape if sizes match
+                        if input_data.size == np.prod(expected_shape):
+                            input_data = input_data.reshape(expected_shape)
+                    
+                    interpreter.set_tensor(inp_detail['index'], input_data)
+                
+                # Time the TFLite inference
+                start_time = time.time()
+                interpreter.invoke()
+                inference_time = time.time() - start_time
+                tflite_times.append(inference_time)
+                
+                tflite_out = [interpreter.get_tensor(out['index']) for out in tflite_outputs]
+                
+                onnx_results.append(onnx_out)
+                tflite_results.append(tflite_out)
+            except Exception as e:
+                print(f"Inference error on sample: {e}")
+                continue
+        
+        if len(onnx_results) == 0:
+            return None
+        
+        # Calculate metrics
+        metrics = []
+        for output_idx in range(len(onnx_outputs)):
+            try:
+                onnx_vals = np.array([r[output_idx] for r in onnx_results])
+                tflite_vals = np.array([r[output_idx] for r in tflite_results])
+                
+                # Flatten for easier calculation
+                onnx_flat = onnx_vals.flatten()
+                tflite_flat = tflite_vals.flatten()
+                
+                # Ensure both have the same shape
+                if onnx_flat.shape != tflite_flat.shape:
+                    print(f"Shape mismatch for output {output_idx}: ONNX {onnx_flat.shape} vs TFLite {tflite_flat.shape}")
+                    continue
+                
+                # Calculate MAE, MSE, RMSE
+                mae = np.mean(np.abs(onnx_flat - tflite_flat))
+                mse = np.mean((onnx_flat - tflite_flat) ** 2)
+                rmse = np.sqrt(mse)
+                
+                # Calculate cosine similarity
+                dot_product = np.dot(onnx_flat, tflite_flat)
+                norm_onnx = np.linalg.norm(onnx_flat)
+                norm_tflite = np.linalg.norm(tflite_flat)
+                cosine_sim = dot_product / (norm_onnx * norm_tflite) if norm_onnx > 0 and norm_tflite > 0 else 0
+                
+                # Calculate max absolute error
+                max_error = np.max(np.abs(onnx_flat - tflite_flat))
+                
+                metrics.append({
+                    'output_name': onnx_outputs[output_idx].name,
+                    'mae': float(mae),
+                    'mse': float(mse),
+                    'rmse': float(rmse),
+                    'cosine_similarity': float(cosine_sim),
+                    'max_error': float(max_error)
+                })
+            except Exception as e:
+                print(f"Error calculating metrics for output {output_idx}: {e}")
+                continue
+        
+        # Calculate average inference time
+        avg_inference_time = np.mean(tflite_times) if tflite_times else 0
+        
+        return {
+            'num_samples': len(onnx_results),
+            'outputs': metrics,
+            'avg_inference_time_us': float(avg_inference_time * 1000000)  # Convert to microseconds
+        }
+        
+    except Exception as e:
+        print(f"Accuracy comparison error: {e}")
+        traceback.print_exc()
+        return None
+
+# Flask App Configuration
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'outputs'
+app.config['JSON_SORT_KEYS'] = False
 
 ALLOWED_EXTENSIONS = {'onnx', 'zip'}
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+
+# --- Helper Functions ---
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def cleanup_old_files():
-    """清理1分钟前的文件"""
+    """Cleanup files older than 30 minutes."""
     try:
         current_time = datetime.now()
-        cutoff_time = current_time - timedelta(minutes=10)
+        cutoff_time = current_time - timedelta(minutes=30)
         
-        # 清理 uploads 文件夹
-        upload_pattern = os.path.join(app.config['UPLOAD_FOLDER'], '*')
-        for file_path in glob.glob(upload_pattern):
-            if os.path.isfile(file_path):
-                file_time = datetime.fromtimestamp(os.path.getctime(file_path))
-                if file_time < cutoff_time:
+        for folder in [app.config['UPLOAD_FOLDER'], app.config['OUTPUT_FOLDER']]:
+            pattern = os.path.join(folder, '*')
+            for file_path in glob.glob(pattern):
+                if os.path.isfile(file_path):
                     try:
-                        os.remove(file_path)
-                        print(f"Deleted upload file: {file_path}")
-                    except Exception as e:
-                        print(f"Error deleting upload file {file_path}: {e}")
-        
-        # 清理 outputs 文件夹
-        output_pattern = os.path.join(app.config['OUTPUT_FOLDER'], '*')
-        for file_path in glob.glob(output_pattern):
-            if os.path.isfile(file_path):
-                file_time = datetime.fromtimestamp(os.path.getctime(file_path))
-                if file_time < cutoff_time:
-                    try:
-                        os.remove(file_path)
-                        print(f"Deleted output file: {file_path}")
-                    except Exception as e:
-                        print(f"Error deleting output file {file_path}: {e}")
-                        
-    except Exception as e:
-        print(f"Error in cleanup_old_files: {e}")
+                        file_time = datetime.fromtimestamp(os.path.getctime(file_path))
+                        if file_time < cutoff_time:
+                            os.remove(file_path)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 def start_cleanup_timer():
-    """启动定时清理线程"""
     def cleanup_loop():
         while True:
-            time.sleep(600)  # 每10分钟检查一次
+            time.sleep(1800)
             cleanup_old_files()
     
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
-    print("File cleanup timer started")
 
 def get_model_info(onnx_path):
-    """提取 ONNX 模型详细信息"""
     try:
         model = onnx.load(onnx_path)
+        graph = model.graph
         
-        # 基本信息
         info = {
             'ir_version': model.ir_version,
             'producer_name': model.producer_name,
-            'producer_version': model.producer_version,
-            'domain': model.domain,
-            'model_version': model.model_version,
-            'doc_string': model.doc_string,
+            'graph_name': graph.name,
+            'inputs': [],
+            'outputs': [],
+            'node_count': len(graph.node),
+            'node_types': {},
         }
         
-        # Opset 版本
-        opset_imports = []
-        for opset in model.opset_import:
-            opset_imports.append({
-                'domain': opset.domain if opset.domain else 'ai.onnx',
-                'version': opset.version
-            })
-        info['opset_imports'] = opset_imports
-        
-        # 图信息
-        graph = model.graph
-        info['graph_name'] = graph.name
-        
-        # 输入信息
-        inputs = []
         for inp in graph.input:
-            input_info = {
+            shape = []
+            for dim in inp.type.tensor_type.shape.dim:
+                shape.append(dim.dim_param if dim.dim_param else dim.dim_value)
+            info['inputs'].append({
                 'name': inp.name,
                 'type': str(inp.type.tensor_type.elem_type),
-                'shape': []
-            }
-            for dim in inp.type.tensor_type.shape.dim:
-                if dim.dim_param:
-                    input_info['shape'].append(dim.dim_param)
-                else:
-                    input_info['shape'].append(dim.dim_value)
-            inputs.append(input_info)
-        info['inputs'] = inputs
-        
-        # 输出信息
-        outputs = []
+                'shape': shape
+            })
+            
         for out in graph.output:
-            output_info = {
+            shape = []
+            for dim in out.type.tensor_type.shape.dim:
+                shape.append(dim.dim_param if dim.dim_param else dim.dim_value)
+            info['outputs'].append({
                 'name': out.name,
                 'type': str(out.type.tensor_type.elem_type),
-                'shape': []
-            }
-            for dim in out.type.tensor_type.shape.dim:
-                if dim.dim_param:
-                    output_info['shape'].append(dim.dim_param)
-                else:
-                    output_info['shape'].append(dim.dim_value)
-            outputs.append(output_info)
-        info['outputs'] = outputs
-        
-        # 节点统计
-        node_types = {}
-        for node in graph.node:
-            if node.op_type in node_types:
-                node_types[node.op_type] += 1
-            else:
-                node_types[node.op_type] = 1
-        
-        info['total_nodes'] = len(graph.node)
-        info['node_types'] = node_types
-        info['total_initializers'] = len(graph.initializer)
-        
-        # 节点详细列表
-        nodes = []
-        for i, node in enumerate(graph.node[:50]):  # 只显示前50个节点
-            nodes.append({
-                'index': i,
-                'op_type': node.op_type,
-                'name': node.name if node.name else f"Node_{i}",
-                'inputs': list(node.input),
-                'outputs': list(node.output)
+                'shape': shape
             })
-        info['nodes'] = nodes
-        if len(graph.node) > 50:
-            info['nodes_truncated'] = True
-            info['total_nodes_count'] = len(graph.node)
-        
+            
+        for node in graph.node:
+            info['node_types'][node.op_type] = info['node_types'].get(node.op_type, 0) + 1
+            
         return info
-        
     except Exception as e:
-        return {'error': str(e), 'traceback': traceback.format_exc()}
+        return {'error': str(e)}
+
+# --- Routes ---
 
 @app.route('/')
 def index():
@@ -181,1128 +321,880 @@ def index():
 def upload_file():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
-    
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and allowed_file(file.filename):
+    if file.filename == '' or not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file'}), 400
+        
+    try:
         filename = secure_filename(file.filename)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         onnx_filename = f"{timestamp}_{filename}"
         onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
-        
         file.save(onnx_path)
         
-        # 获取模型信息
-        model_info = get_model_info(onnx_path)
-        
-        return jsonify({
-            'success': True,
-            'filename': onnx_filename,
-            'model_info': model_info
-        })
-    
-    return jsonify({'error': 'Invalid file type. Only .onnx and .zip files are allowed'}), 400
+        info = get_model_info(onnx_path)
+        return jsonify({'success': True, 'filename': onnx_filename, 'model_info': info})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/upload_calibration_data', methods=['POST'])
-def upload_calibration_data():
-    """上传校准数据zip文件"""
+@app.route('/upload_calibration', methods=['POST'])
+def upload_calibration():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and file.filename.lower().endswith('.zip'):
+    if not file.filename.lower().endswith('.zip'):
+        return jsonify({'error': 'Only .zip files allowed'}), 400
+        
+    try:
         filename = secure_filename(file.filename)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         zip_filename = f"calibration_{timestamp}_{filename}"
         zip_path = os.path.join(app.config['UPLOAD_FOLDER'], zip_filename)
-        
         file.save(zip_path)
         
-        # 验证zip文件内容
-        try:
-            import zipfile
-            npy_count = 0
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                for file_info in zip_ref.filelist:
-                    if file_info.filename.endswith('.npy'):
-                        npy_count += 1
+        # Validate content
+        npy_files = []
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            npy_files = [f for f in z.namelist() if f.endswith('.npy')]
             
-            if npy_count == 0:
-                os.remove(zip_path)
-                return jsonify({'error': 'ZIP文件中未找到.npy文件'}), 400
-            
-            return jsonify({
-                'success': True,
-                'filename': zip_filename,
-                'npy_files_count': npy_count,
-                'message': f'成功上传校准数据，包含 {npy_count} 个.npy文件'
-            })
-            
-        except Exception as e:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-            return jsonify({'error': f'ZIP文件验证失败: {str(e)}'}), 400
-    
-    return jsonify({'error': 'Invalid file type. Only .zip files are allowed for calibration data'}), 400
-
-@app.route('/convert', methods=['POST'])
-def convert_model():
-    try:
-        data = request.json
-        onnx_filename = data.get('filename')
-        options = data.get('options', {})
-        
-        if not onnx_filename:
-            return jsonify({'error': 'No filename provided'}), 400
-        
-        onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
-        
-        if not os.path.exists(onnx_path):
-            return jsonify({'error': 'ONNX file not found'}), 404
-        
-        # 生成输出文件名
-        base_name = os.path.splitext(onnx_filename)[0]
-        tflite_filename = f"{base_name}.tflite"
-        tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], tflite_filename)
-        
-        # 获取转换前的模型信息
-        start_time = datetime.now()
-        original_model_info = get_model_info(onnx_path)
-        
-        # 转换模型
-        print(f"Converting {onnx_path} to {tflite_path}")
-        
-        # 使用 convert_model 函数
-        binary_tflite_model = convert.convert_model(onnx_path)
-        
-        # 保存 TFLite 模型
-        with open(tflite_path, 'wb') as f:
-            f.write(binary_tflite_model)
-        
-        conversion_time = datetime.now() - start_time
-        
-        # 获取文件大小
-        onnx_size = os.path.getsize(onnx_path)
-        tflite_size = os.path.getsize(tflite_path)
-        compression_ratio = (1 - tflite_size/onnx_size) * 100
-        
-        # 生成转换报告
-        conversion_report = {
-            'conversion_time': f"{conversion_time.total_seconds():.2f} 秒",
-            'original_format': 'ONNX',
-            'target_format': 'TensorFlow Lite',
-            'file_sizes': {
-                'onnx_size': onnx_size,
-                'onnx_size_mb': f"{onnx_size / 1024 / 1024:.2f} MB",
-                'tflite_size': tflite_size,
-                'tflite_size_mb': f"{tflite_size / 1024 / 1024:.2f} MB",
-                'compression_ratio': f"{compression_ratio:.2f}%",
-                'size_reduction': f"{(onnx_size - tflite_size) / 1024 / 1024:.2f} MB"
-            },
-            'model_structure': {
-                'total_nodes': original_model_info.get('total_nodes', 'N/A'),
-                'total_initializers': original_model_info.get('total_initializers', 'N/A'),
-                'input_tensors': len(original_model_info.get('inputs', [])),
-                'output_tensors': len(original_model_info.get('outputs', [])),
-                'node_types': original_model_info.get('node_types', {})
-            },
-            'conversion_options': options,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'status': 'SUCCESS',
-            'accuracy_comparison': None  # 将在前端触发精度对比后填充
-        }
-        
+        if not npy_files:
+             os.remove(zip_path)
+             return jsonify({'error': 'ZIP contains no .npy files'}), 400
+             
         return jsonify({
-            'success': True,
-            'tflite_filename': tflite_filename,
-            'onnx_size': onnx_size,
-            'tflite_size': tflite_size,
-            'compression_ratio': f"{compression_ratio:.2f}%",
-            'conversion_report': conversion_report
+            'success': True, 
+            'filename': zip_filename, 
+            'file_count': len(npy_files),
+            'files': npy_files[:10] # send preview
         })
-        
-    except Exception as e:
-        error_msg = str(e)
-        trace = traceback.format_exc()
-        print(f"Conversion error: {error_msg}")
-        print(trace)
-        return jsonify({
-            'error': error_msg,
-            'traceback': trace
-        }), 500
-
-@app.route('/quantize', methods=['POST'])
-def quantize_model():
-    try:
-        data = request.json
-        onnx_filename = data.get('filename')
-        selected_layers = data.get('selected_layers', [])
-        calibration_data_filename = data.get('calibration_data_filename', None)
-        
-        if not onnx_filename:
-            return jsonify({'error': 'No filename provided'}), 400
-        
-        onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
-        
-        if not os.path.exists(onnx_path):
-            return jsonify({'error': 'ONNX file not found'}), 404
-        
-        # 生成量化ONNX模型文件名和TFLite文件名
-        base_name = os.path.splitext(onnx_filename)[0]
-        quantized_onnx_filename = f"{base_name}_quantized.onnx"
-        quantized_onnx_path = os.path.join(app.config['OUTPUT_FOLDER'], quantized_onnx_filename)
-        quantized_tflite_filename = f"{base_name}_quantized.tflite"
-        quantized_tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], quantized_tflite_filename)
-        
-        start_time = datetime.now()
-        
-        # 加载ONNX模型
-        onnx_model = onnx.load(onnx_path)
-        
-        # 创建校准数据读取器
-        validation_report = None
-        if calibration_data_filename:
-            calibration_data_path = os.path.join(app.config['UPLOAD_FOLDER'], calibration_data_filename)
-            if os.path.exists(calibration_data_path):
-                calibration_data_reader, validation_report = create_real_data_calibration_reader(onnx_model, calibration_data_path)
-                print(f"Using real calibration data from: {calibration_data_filename}")
-            else:
-                print(f"Calibration data file not found, using random data")
-                calibration_data_reader = create_calibration_data_reader(onnx_model)
-        else:
-            print("No calibration data provided, using random data")
-            calibration_data_reader = create_calibration_data_reader(onnx_model)
-        
-        quantization_config = QuantizationConfig(calibration_data_reader)
-        
-        # 创建QDQ量化器，只量化选定的层类型
-        quantizer = QDQQuantizer(op_types_to_quantize=selected_layers)
-        
-        print(f"Quantizing model with layers: {selected_layers}")
-        
-        # 量化模型
-        quantized_onnx_model = quantizer.quantize_model(onnx_model, quantization_config)
-        
-        # 保存量化后的ONNX模型
-        onnx.save(quantized_onnx_model, quantized_onnx_path)
-        
-        # 转换量化后的ONNX模型到TFLite
-        quantized_tflite_model = convert.convert_model(quantized_onnx_path)
-        
-        # 保存量化后的TFLite模型
-        with open(quantized_tflite_path, 'wb') as f:
-            f.write(quantized_tflite_model)
-        
-        quantization_time = datetime.now() - start_time
-        
-        # 获取文件大小信息
-        onnx_size = os.path.getsize(onnx_path)
-        quantized_onnx_size = os.path.getsize(quantized_onnx_path)
-        quantized_tflite_size = os.path.getsize(quantized_tflite_path)
-        
-        # 计算压缩比
-        additional_compression = (1 - quantized_tflite_size/onnx_size) * 100
-        
-        # 构建量化报告
-        quantization_report = {
-            'quantization_time': f"{quantization_time.total_seconds():.2f} 秒",
-            'quantization_method': 'QDQ (Quantization-Dequantization)',
-            'quantized_layer_types': selected_layers,
-            'file_sizes': {
-                'original_onnx_size': onnx_size,
-                'original_onnx_size_mb': f"{onnx_size / 1024 / 1024:.2f} MB",
-                'quantized_onnx_size': quantized_onnx_size,
-                'quantized_onnx_size_mb': f"{quantized_onnx_size / 1024 / 1024:.2f} MB",
-                'quantized_tflite_size': quantized_tflite_size,
-                'quantized_tflite_size_mb': f"{quantized_tflite_size / 1024 / 1024:.2f} MB",
-                'additional_compression_ratio': f"{additional_compression:.2f}%"
-            },
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'status': 'SUCCESS',
-            'accuracy_comparison': None,  # 将在前端触发精度对比后填充
-        }
-        
-        return jsonify({
-            'success': True,
-            'quantized_onnx_filename': quantized_onnx_filename,
-            'quantized_tflite_filename': quantized_tflite_filename,
-            'original_onnx_size': onnx_size,
-            'quantized_onnx_size': quantized_onnx_size,
-            'quantized_tflite_size': quantized_tflite_size,
-            'additional_compression_ratio': f"{additional_compression:.2f}%",
-            'quantization_time': f"{quantization_time.total_seconds():.2f} 秒",
-            'quantized_layers': selected_layers,
-            'quantization_report': quantization_report,
-            'validation_report': validation_report
-        })
-        
-    except Exception as e:
-        error_msg = str(e)
-        trace = traceback.format_exc()
-        print(f"Quantization error: {error_msg}")
-        print(trace)
-        return jsonify({
-            'error': error_msg,
-            'traceback': trace
-        }), 500
-
-
-def create_calibration_data_reader(onnx_model):
-    """创建校准数据读取器"""
-    try:
-        # 获取模型输入信息
-        inputs = {}
-        initializer_names = [init.name for init in onnx_model.graph.initializer]
-        
-        for input_info in onnx_model.graph.input:
-            if input_info.name in initializer_names:
-                continue  # 跳过初始化器
-                
-            # 解析输入维度
-            dims = []
-            for dim in input_info.type.tensor_type.shape.dim:
-                if dim.dim_value > 0:
-                    dims.append(dim.dim_value)
-                elif dim.dim_param:
-                    # 动态维度，使用常见的默认值
-                    if 'batch' in dim.dim_param.lower():
-                        dims.append(1)  # 批大小默认为1
-                    else:
-                        dims.append(224)  # 其他动态维度默认为224
-                else:
-                    dims.append(1)  # 未知维度默认为1
-            
-            # 确定数据类型
-            elem_type = input_info.type.tensor_type.elem_type
-            if elem_type == onnx.TensorProto.FLOAT:
-                numpy_type = np.float32
-            elif elem_type == onnx.TensorProto.INT64:
-                numpy_type = np.int64
-            else:
-                numpy_type = np.float32  # 默认类型
-            
-            inputs[input_info.name] = InputSpec(dims, numpy_type)
-        
-        return RandomDataCalibrationDataReader(inputs, num_samples=5)
-    
-    except Exception as e:
-        print(f"Error creating calibration data reader: {e}")
-        # 返回一个默认的校准数据读取器
-        default_inputs = {"input": InputSpec([1, 3, 224, 224], np.float32)}
-        return RandomDataCalibrationDataReader(default_inputs, num_samples=5)
-
-
-def create_real_data_calibration_reader(onnx_model, calibration_data_path):
-    """创建基于真实数据的校准数据读取器，返回读取器和验证报告"""
-    import zipfile
-    import tempfile
-    import shutil
-    
-    # 初始化验证报告
-    validation_report = {
-        'total_files': 0,
-        'valid_files': 0,
-        'invalid_files': 0,
-        'validation_errors': [],
-        'file_details': [],
-        'expected_specs': {},
-        'loaded_samples': 0,
-        'status': 'processing'
-    }
-    
-    try:
-        # 获取模型输入信息
-        input_info_dict = {}
-        initializer_names = [init.name for init in onnx_model.graph.initializer]
-        
-        for input_info in onnx_model.graph.input:
-            if input_info.name in initializer_names:
-                continue
-            
-            # 解析输入维度和类型，确保第一维是batch=1
-            dims = []
-            for i, dim in enumerate(input_info.type.tensor_type.shape.dim):
-                if i == 0:  # 第一维设置为batch=1
-                    dims.append(1)
-                elif dim.dim_value > 0:
-                    dims.append(dim.dim_value)
-                elif dim.dim_param:
-                    if 'batch' in dim.dim_param.lower():
-                        dims.append(1)
-                    else:
-                        dims.append(224)  # 默认尺寸
-                else:
-                    dims.append(1)
-            
-            elem_type = input_info.type.tensor_type.elem_type
-            if elem_type == onnx.TensorProto.FLOAT:
-                numpy_type = np.float32
-                dtype_str = 'float32'
-            elif elem_type == onnx.TensorProto.INT64:
-                numpy_type = np.int64
-                dtype_str = 'int64'
-            else:
-                numpy_type = np.float32
-                dtype_str = 'float32'
-                
-            input_info_dict[input_info.name] = {
-                'shape': dims,
-                'dtype': numpy_type,  # 用于实际数据处理
-                'dtype_str': dtype_str  # 用于JSON序列化
-            }
-        
-        # 为JSON序列化创建可序列化的expected_specs
-        serializable_specs = {}
-        for name, specs in input_info_dict.items():
-            serializable_specs[name] = {
-                'shape': specs['shape'],
-                'dtype': specs['dtype_str']
-            }
-        validation_report['expected_specs'] = serializable_specs
-        print(f"Expected input specifications (batch=1): {serializable_specs}")
-        
-        # 解压zip文件并加载npy数据
-        calibration_data = []
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 解压zip文件
-            with zipfile.ZipFile(calibration_data_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
-            
-            # 查找所有npy文件
-            npy_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.endswith('.npy'):
-                        npy_files.append(os.path.join(root, file))
-            
-            validation_report['total_files'] = len(npy_files)
-            print(f"Found {len(npy_files)} npy files in calibration data")
-            
-            # 加载并验证每个npy文件
-            for npy_file in npy_files:
-                file_detail = {
-                    'filename': os.path.basename(npy_file),
-                    'status': 'failed',
-                    'actual_shape': None,
-                    'actual_dtype': None,
-                    'actual_dtype': None,
-                    'matched_input': None,
-                    'error': None
-                }
-                
-                try:
-                    data = np.load(npy_file)
-                    file_detail['actual_shape'] = data.shape
-                    file_detail['actual_dtype'] = str(data.dtype)
-                    
-                    print(f"Loaded {os.path.basename(npy_file)}: shape={data.shape}, dtype={data.dtype}")
-                    
-                    # 记录实际的数据信息
-                    file_detail['actual_shape'] = list(data.shape)
-                    file_detail['actual_dtype'] = str(data.dtype)
-                    
-                    # 验证数据形状是否符合batch=1的要求
-                    matched_input = None
-                    shape_valid = False
-                    
-                    # 如果只有一个输入，直接匹配
-                    if len(input_info_dict) == 1:
-                        input_name = list(input_info_dict.keys())[0]
-                        expected_shape = input_info_dict[input_name]['shape']
-                        expected_dtype = input_info_dict[input_name]['dtype']
-                        
-                        # 检查是否已经是batch=1的形状
-                        if data.shape == tuple(expected_shape):
-                            matched_input = input_name
-                            shape_valid = True
-                        # 检查是否缺少batch维度
-                        elif data.shape == tuple(expected_shape[1:]) and expected_shape[0] == 1:
-                            matched_input = input_name
-                            shape_valid = True
-                            # 添加batch维度
-                            data = np.expand_dims(data, axis=0)
-                            print(f"  Added batch dimension: {data.shape}")
-                        # 检查是否可以reshape
-                        elif data.size == np.prod(expected_shape):
-                            matched_input = input_name
-                            shape_valid = True
-                            data = data.reshape(expected_shape)
-                            print(f"  Reshaped to: {data.shape}")
-                    else:
-                        # 多输入情况，尝试根据文件名或形状匹配
-                        for input_name, specs in input_info_dict.items():
-                            expected_shape = specs['shape']
-                            
-                            # 文件名匹配
-                            if input_name.lower() in os.path.basename(npy_file).lower():
-                                # 验证形状
-                                if data.shape == tuple(expected_shape):
-                                    matched_input = input_name
-                                    shape_valid = True
-                                    break
-                                elif data.shape == tuple(expected_shape[1:]) and expected_shape[0] == 1:
-                                    matched_input = input_name
-                                    shape_valid = True
-                                    data = np.expand_dims(data, axis=0)
-                                    break
-                    
-                    if not shape_valid or not matched_input:
-                        error_msg = f"Shape mismatch: got {data.shape}, expected one of {[tuple(specs['shape']) for specs in input_info_dict.values()]}"
-                        file_detail['error'] = error_msg
-                        validation_report['invalid_files'] += 1
-                        validation_report['validation_errors'].append(f"{os.path.basename(npy_file)}: {error_msg}")
-                        print(f"  ❌ {error_msg}")
-                    else:
-                        # 确保数据类型正确
-                        expected_dtype = input_info_dict[matched_input]['dtype']
-                        if data.dtype != expected_dtype:
-                            data = data.astype(expected_dtype)
-                            print(f"  Converted dtype to: {expected_dtype}")
-                        
-                        # 最终验证：确保是batch=1
-                        if data.shape[0] != 1:
-                            error_msg = f"Batch size must be 1, got {data.shape[0]}"
-                            file_detail['error'] = error_msg
-                            validation_report['invalid_files'] += 1
-                            validation_report['validation_errors'].append(f"{os.path.basename(npy_file)}: {error_msg}")
-                            print(f"  ❌ {error_msg}")
-                        else:
-                            sample = {matched_input: data}
-                            calibration_data.append(sample)
-                            file_detail['status'] = 'success'
-                            file_detail['matched_input'] = matched_input
-                            validation_report['valid_files'] += 1
-                            print(f"  ✓ Valid sample for input '{matched_input}': {data.shape}")
-                        
-                except Exception as e:
-                    error_msg = f"Error loading file: {str(e)}"
-                    file_detail['error'] = error_msg
-                    validation_report['invalid_files'] += 1
-                    validation_report['validation_errors'].append(f"{os.path.basename(npy_file)}: {error_msg}")
-                    print(f"  ❌ Error loading {os.path.basename(npy_file)}: {e}")
-                
-                validation_report['file_details'].append(file_detail)
-        
-        validation_report['loaded_samples'] = len(calibration_data)
-        validation_report['status'] = 'completed'
-        
-        # 生成验证报告摘要
-        print(f"\n=== Calibration Data Validation Report ===")
-        print(f"Total files found: {validation_report['total_files']}")
-        print(f"Valid files: {validation_report['valid_files']}")
-        print(f"Invalid files: {validation_report['invalid_files']}")
-        print(f"Successfully loaded samples: {validation_report['loaded_samples']}")
-        
-        if validation_report['validation_errors']:
-            print(f"\nValidation Errors:")
-            for error in validation_report['validation_errors'][:10]:  # 显示前10个错误
-                print(f"  - {error}")
-            if len(validation_report['validation_errors']) > 10:
-                print(f"  ... and {len(validation_report['validation_errors']) - 10} more errors")
-        
-        if not calibration_data:
-            print("\nNo valid calibration data found, using random data")
-            return create_calibration_data_reader(onnx_model), validation_report
-        
-        print(f"\n✓ Successfully loaded {len(calibration_data)} calibration samples")
-        
-        # 创建自定义校准数据读取器
-        class RealDataCalibrationReader:
-            def __init__(self, calibration_data, validation_report):
-                self.calibration_data = calibration_data
-                self.validation_report = validation_report
-                self.iter_index = 0
-            
-            def get_next(self):
-                if self.iter_index < len(self.calibration_data):
-                    data = self.calibration_data[self.iter_index]
-                    self.iter_index += 1
-                    return data
-                else:
-                    return None
-            
-            def get_validation_report(self):
-                return self.validation_report
-        
-        return RealDataCalibrationReader(calibration_data, validation_report), validation_report
-        
-    except Exception as e:
-        error_msg = f"Error creating real data calibration reader: {e}"
-        print(error_msg)
-        validation_report['validation_errors'].append(error_msg)
-        validation_report['status'] = 'error'
-        print(f"Falling back to random data calibration reader")
-        return create_calibration_data_reader(onnx_model), validation_report
-
-
-def generate_test_data(input_specs: Dict[str, Tuple], num_samples: int = 100) -> List[Dict[str, np.ndarray]]:
-    """生成测试数据"""
-    test_data = []
-    np.random.seed(42)  # 设置随机种子确保可重现性
-    
-    for i in range(num_samples):
-        sample = {}
-        for input_name, (shape, dtype) in input_specs.items():
-            if dtype in [np.float32, np.float64]:
-                # 生成正态分布的浮点数据，范围在-1到1之间
-                sample[input_name] = np.random.normal(0, 0.5, shape).astype(dtype)
-            elif dtype in [np.int32, np.int64]:
-                # 生成整数数据
-                sample[input_name] = np.random.randint(0, 100, shape).astype(dtype)
-            else:
-                # 默认生成浮点数据
-                sample[input_name] = np.random.normal(0, 0.5, shape).astype(np.float32)
-        test_data.append(sample)
-    
-    return test_data
-
-
-def run_onnx_inference(onnx_path: str, test_data: List[Dict[str, np.ndarray]]) -> List[Dict[str, np.ndarray]]:
-    """运行ONNX模型推理"""
-    try:
-        # 创建ONNX Runtime会话
-        session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-        
-        results = []
-        for sample in test_data:
-            try:
-                # 运行推理
-                outputs = session.run(None, sample)
-                # 将输出转换为字典格式
-                output_names = [output.name for output in session.get_outputs()]
-                result = {name: output for name, output in zip(output_names, outputs)}
-                results.append(result)
-            except Exception as e:
-                print(f"ONNX inference error for sample: {e}")
-                results.append({})
-        
-        return results
-    except Exception as e:
-        print(f"ONNX model loading error: {e}")
-        return []
-
-
-def run_tflite_inference(tflite_path: str, test_data: List[Dict[str, np.ndarray]]) -> List[Dict[str, np.ndarray]]:
-    """运行TFLite模型推理"""
-    try:
-        # 加载TFLite模型
-        interpreter = tf.lite.Interpreter(model_path=tflite_path)
-        interpreter.allocate_tensors()
-        
-        # 获取输入和输出详情
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        
-        results = []
-        for sample in test_data:
-            try:
-                # 设置输入数据
-                for input_detail in input_details:
-                    input_name = input_detail['name']
-                    input_index = input_detail['index']
-                    
-                    # 查找对应的输入数据
-                    input_data = None
-                    for key, value in sample.items():
-                        if key == input_name or key in input_name or input_name in key:
-                            input_data = value
-                            break
-                    
-                    if input_data is not None:
-                        # 确保数据类型和形状匹配
-                        if input_data.dtype != input_detail['dtype']:
-                            input_data = input_data.astype(input_detail['dtype'])
-                        if input_data.shape != tuple(input_detail['shape']):
-                            # 如果形状不匹配，尝试reshape
-                            input_data = np.reshape(input_data, input_detail['shape'])
-                        
-                        interpreter.set_tensor(input_index, input_data)
-                
-                # 运行推理
-                interpreter.invoke()
-                
-                # 获取输出
-                result = {}
-                for output_detail in output_details:
-                    output_data = interpreter.get_tensor(output_detail['index'])
-                    result[output_detail['name']] = output_data.copy()
-                
-                results.append(result)
-            except Exception as e:
-                print(f"TFLite inference error for sample: {e}")
-                results.append({})
-        
-        return results
-    except Exception as e:
-        print(f"TFLite model loading error: {e}")
-        return []
-
-
-def calculate_accuracy_metrics(onnx_results: List[Dict], tflite_results: List[Dict], quantized_tflite_results: List[Dict] = None) -> Dict:
-    """计算精度指标"""
-    metrics = {
-        'total_samples': len(onnx_results),
-        'successful_samples': 0,
-        'onnx_vs_tflite': {},
-        'onnx_vs_quantized_tflite': {}
-    }
-    
-    if not onnx_results or not tflite_results:
-        return metrics
-    
-    # ONNX vs TFLite 比较
-    onnx_tflite_errors = []
-    successful_comparisons = 0
-    
-    for i, (onnx_result, tflite_result) in enumerate(zip(onnx_results, tflite_results)):
-        if not onnx_result or not tflite_result:
-            continue
-        
-        try:
-            # 假设两个模型都只有一个输出，取第一个输出进行比较
-            onnx_output = list(onnx_result.values())[0] if onnx_result else None
-            tflite_output = list(tflite_result.values())[0] if tflite_result else None
-            
-            if onnx_output is not None and tflite_output is not None:
-                # 确保形状一致
-                if onnx_output.shape != tflite_output.shape:
-                    # 尝试reshape
-                    min_size = min(onnx_output.size, tflite_output.size)
-                    onnx_output = onnx_output.flatten()[:min_size]
-                    tflite_output = tflite_output.flatten()[:min_size]
-                
-                # 计算各种误差指标
-                mse = np.mean((onnx_output - tflite_output) ** 2)
-                mae = np.mean(np.abs(onnx_output - tflite_output))
-                max_error = np.max(np.abs(onnx_output - tflite_output))
-                
-                # 计算相对误差（避免除零）
-                rel_error = np.mean(np.abs(onnx_output - tflite_output) / (np.abs(onnx_output) + 1e-8))
-                
-                onnx_tflite_errors.append({
-                    'mse': float(mse),
-                    'mae': float(mae),
-                    'max_error': float(max_error),
-                    'relative_error': float(rel_error)
-                })
-                
-                successful_comparisons += 1
-        except Exception as e:
-            print(f"Error comparing sample {i}: {e}")
-            continue
-    
-    metrics['successful_samples'] = successful_comparisons
-    
-    if onnx_tflite_errors:
-        # 计算统计指标
-        metrics['onnx_vs_tflite'] = {
-            'mean_mse': float(np.mean([e['mse'] for e in onnx_tflite_errors])),
-            'mean_mae': float(np.mean([e['mae'] for e in onnx_tflite_errors])),
-            'mean_max_error': float(np.mean([e['max_error'] for e in onnx_tflite_errors])),
-            'mean_relative_error': float(np.mean([e['relative_error'] for e in onnx_tflite_errors])),
-            'max_mse': float(np.max([e['mse'] for e in onnx_tflite_errors])),
-            'max_mae': float(np.max([e['mae'] for e in onnx_tflite_errors])),
-            'max_max_error': float(np.max([e['max_error'] for e in onnx_tflite_errors])),
-            'max_relative_error': float(np.max([e['relative_error'] for e in onnx_tflite_errors]))
-        }
-    
-    # ONNX vs 量化TFLite 比较（如果提供了量化模型结果）
-    if quantized_tflite_results:
-        onnx_quantized_errors = []
-        
-        for i, (onnx_result, quantized_result) in enumerate(zip(onnx_results, quantized_tflite_results)):
-            if not onnx_result or not quantized_result:
-                continue
-            
-            try:
-                onnx_output = list(onnx_result.values())[0] if onnx_result else None
-                quantized_output = list(quantized_result.values())[0] if quantized_result else None
-                
-                if onnx_output is not None and quantized_output is not None:
-                    # 确保形状一致
-                    if onnx_output.shape != quantized_output.shape:
-                        min_size = min(onnx_output.size, quantized_output.size)
-                        onnx_output = onnx_output.flatten()[:min_size]
-                        quantized_output = quantized_output.flatten()[:min_size]
-                    
-                    # 计算误差指标
-                    mse = np.mean((onnx_output - quantized_output) ** 2)
-                    mae = np.mean(np.abs(onnx_output - quantized_output))
-                    max_error = np.max(np.abs(onnx_output - quantized_output))
-                    rel_error = np.mean(np.abs(onnx_output - quantized_output) / (np.abs(onnx_output) + 1e-8))
-                    
-                    onnx_quantized_errors.append({
-                        'mse': float(mse),
-                        'mae': float(mae),
-                        'max_error': float(max_error),
-                        'relative_error': float(rel_error)
-                    })
-            except Exception as e:
-                print(f"Error comparing quantized sample {i}: {e}")
-                continue
-        
-        if onnx_quantized_errors:
-            metrics['onnx_vs_quantized_tflite'] = {
-                'mean_mse': float(np.mean([e['mse'] for e in onnx_quantized_errors])),
-                'mean_mae': float(np.mean([e['mae'] for e in onnx_quantized_errors])),
-                'mean_max_error': float(np.mean([e['max_error'] for e in onnx_quantized_errors])),
-                'mean_relative_error': float(np.mean([e['relative_error'] for e in onnx_quantized_errors])),
-                'max_mse': float(np.max([e['mse'] for e in onnx_quantized_errors])),
-                'max_mae': float(np.max([e['mae'] for e in onnx_quantized_errors])),
-                'max_max_error': float(np.max([e['max_error'] for e in onnx_quantized_errors])),
-                'max_relative_error': float(np.max([e['relative_error'] for e in onnx_quantized_errors]))
-            }
-    
-    return metrics
-
-
-def get_model_input_specs(onnx_path: str) -> Dict[str, Tuple]:
-    """获取模型输入规格"""
-    try:
-        model = onnx.load(onnx_path)
-        input_specs = {}
-        initializer_names = [init.name for init in model.graph.initializer]
-        
-        for input_info in model.graph.input:
-            if input_info.name in initializer_names:
-                continue
-            
-            # 解析输入维度
-            dims = []
-            for dim in input_info.type.tensor_type.shape.dim:
-                if dim.dim_value > 0:
-                    dims.append(dim.dim_value)
-                elif dim.dim_param:
-                    # 动态维度，使用默认值
-                    if 'batch' in dim.dim_param.lower():
-                        dims.append(1)
-                    else:
-                        dims.append(224)
-                else:
-                    dims.append(1)
-            
-            # 确定数据类型
-            elem_type = input_info.type.tensor_type.elem_type
-            if elem_type == onnx.TensorProto.FLOAT:
-                numpy_type = np.float32
-            elif elem_type == onnx.TensorProto.INT64:
-                numpy_type = np.int64
-            else:
-                numpy_type = np.float32
-            
-            input_specs[input_info.name] = (tuple(dims), numpy_type)
-        
-        return input_specs
-    
-    except Exception as e:
-        print(f"Error getting model input specs: {e}")
-        # 返回默认规格
-        return {"input": ((1, 3, 224, 224), np.float32)}
-
-
-@app.route('/accuracy_comparison', methods=['POST'])
-def accuracy_comparison():
-    """执行精度对比分析"""
-    try:
-        data = request.json
-        onnx_filename = data.get('filename')
-        tflite_filename = data.get('tflite_filename')
-        quantized_tflite_filename = data.get('quantized_tflite_filename')
-        num_samples = data.get('num_samples', 100)
-        
-        if not onnx_filename:
-            return jsonify({'error': 'No ONNX filename provided'}), 400
-        
-        if not tflite_filename:
-            return jsonify({'error': 'No TFLite filename provided'}), 400
-        
-        # 文件路径
-        onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
-        tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], tflite_filename)
-        
-        if not os.path.exists(onnx_path):
-            return jsonify({'error': 'ONNX file not found'}), 404
-        
-        if not os.path.exists(tflite_path):
-            return jsonify({'error': 'TFLite file not found'}), 404
-        
-        start_time = datetime.now()
-        
-        # 获取模型输入规格
-        input_specs = get_model_input_specs(onnx_path)
-        
-        # 生成测试数据
-        print(f"Generating {num_samples} test samples...")
-        test_data = generate_test_data(input_specs, num_samples)
-        
-        # 运行ONNX推理
-        print("Running ONNX inference...")
-        onnx_results = run_onnx_inference(onnx_path, test_data)
-        
-        # 运行TFLite推理
-        print("Running TFLite inference...")
-        tflite_results = run_tflite_inference(tflite_path, test_data)
-        
-        # 运行量化TFLite推理（如果提供了量化模型）
-        quantized_tflite_results = None
-        if quantized_tflite_filename:
-            quantized_tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], quantized_tflite_filename)
-            if os.path.exists(quantized_tflite_path):
-                print("Running quantized TFLite inference...")
-                quantized_tflite_results = run_tflite_inference(quantized_tflite_path, test_data)
-        
-        # 计算精度指标
-        print("Calculating accuracy metrics...")
-        accuracy_metrics = calculate_accuracy_metrics(onnx_results, tflite_results, quantized_tflite_results)
-        
-        comparison_time = datetime.now() - start_time
-        
-        # 构建完整的精度对比报告
-        accuracy_report = {
-            'test_parameters': {
-                'num_samples': num_samples,
-                'input_specs': {name: {'shape': list(shape), 'dtype': str(dtype)} 
-                              for name, (shape, dtype) in input_specs.items()},
-                'comparison_time': f"{comparison_time.total_seconds():.2f} 秒"
-            },
-            'inference_results': {
-                'onnx_successful_inferences': len([r for r in onnx_results if r]),
-                'tflite_successful_inferences': len([r for r in tflite_results if r]),
-                'quantized_tflite_successful_inferences': len([r for r in quantized_tflite_results if r]) if quantized_tflite_results else 0
-            },
-            'accuracy_metrics': accuracy_metrics,
-            'summary': {}
-        }
-        
-        # 添加汇总信息
-        if accuracy_metrics.get('onnx_vs_tflite'):
-            accuracy_report['summary']['onnx_vs_tflite'] = {
-                'average_relative_error': f"{accuracy_metrics['onnx_vs_tflite']['mean_relative_error']:.6f}",
-                'max_relative_error': f"{accuracy_metrics['onnx_vs_tflite']['max_relative_error']:.6f}",
-                'average_mae': f"{accuracy_metrics['onnx_vs_tflite']['mean_mae']:.6f}",
-                'max_mae': f"{accuracy_metrics['onnx_vs_tflite']['max_mae']:.6f}"
-            }
-        
-        if accuracy_metrics.get('onnx_vs_quantized_tflite'):
-            accuracy_report['summary']['onnx_vs_quantized_tflite'] = {
-                'average_relative_error': f"{accuracy_metrics['onnx_vs_quantized_tflite']['mean_relative_error']:.6f}",
-                'max_relative_error': f"{accuracy_metrics['onnx_vs_quantized_tflite']['max_relative_error']:.6f}",
-                'average_mae': f"{accuracy_metrics['onnx_vs_quantized_tflite']['mean_mae']:.6f}",
-                'max_mae': f"{accuracy_metrics['onnx_vs_quantized_tflite']['max_mae']:.6f}"
-            }
-        
-        return jsonify({
-            'success': True,
-            'accuracy_report': accuracy_report
-        })
-        
-    except Exception as e:
-        error_msg = str(e)
-        trace = traceback.format_exc()
-        print(f"Accuracy comparison error: {error_msg}")
-        print(trace)
-        return jsonify({
-            'error': error_msg,
-            'traceback': trace
-        }), 500
-
-
-@app.route('/download/<filename>')
-def download_file(filename):
-    try:
-        file_path = os.path.join(app.config['OUTPUT_FOLDER'], filename)
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True)
-        else:
-            return jsonify({'error': 'File not found'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/convert_to_cpp', methods=['POST'])
-def convert_to_cpp():
-    """将TFLite模型转换为C++文件"""
+@app.route('/convert', methods=['POST'])
+def convert_model():
+    log_capture_string = io.StringIO()
     try:
-        data = request.json
-        tflite_filename = data.get('tflite_filename')
-        
-        if not tflite_filename:
-            return jsonify({'error': 'No TFLite filename provided'}), 400
-        
-        tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], tflite_filename)
-        
-        if not os.path.exists(tflite_path):
-            return jsonify({'error': 'TFLite file not found'}), 404
-        
-        # 检查是否有xxd命令（Windows可能需要安装Git Bash或WSL）
-        xxd_available = False
-        try:
-            # 首先尝试直接调用xxd
-            result = subprocess.run(['xxd', '-v'], capture_output=True, text=True)
-            xxd_available = True
-        except FileNotFoundError:
-            # 如果xxd不可用，尝试使用Git Bash中的xxd
-            try:
-                result = subprocess.run(['C:\\Program Files\\Git\\usr\\bin\\xxd.exe', '-v'], 
-                                       capture_output=True, text=True)
-                xxd_available = True
-            except FileNotFoundError:
-                pass
-        
-        if not xxd_available:
-            # 如果没有xxd，使用Python实现相同功能
-            return convert_to_cpp_python(tflite_path, tflite_filename)
-        
-        # 生成C++文件名
-        base_name = os.path.splitext(tflite_filename)[0]
-        cpp_filename = f"{base_name}.cc"
-        cpp_path = os.path.join(app.config['OUTPUT_FOLDER'], cpp_filename)
-        
-        # 使用xxd命令转换
-        try:
-            # 尝试使用系统的xxd
-            result = subprocess.run(['xxd', '-i', tflite_path], 
-                                   capture_output=True, text=True, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            # 尝试使用Git Bash的xxd
-            try:
-                result = subprocess.run(['C:\\Program Files\\Git\\usr\\bin\\xxd.exe', '-i', tflite_path], 
-                                       capture_output=True, text=True, check=True)
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                return convert_to_cpp_python(tflite_path, tflite_filename)
-        
-        # 保存C++文件
-        with open(cpp_path, 'w', encoding='utf-8') as f:
-            f.write(result.stdout)
-        
-        # 获取文件大小
-        tflite_size = os.path.getsize(tflite_path)
-        cpp_size = os.path.getsize(cpp_path)
-        
-        return jsonify({
-            'success': True,
-            'cpp_filename': cpp_filename,
-            'tflite_size': tflite_size,
-            'cpp_size': cpp_size,
-            'message': 'TFLite模型已成功转换为C++文件'
-        })
-        
-    except Exception as e:
-        error_msg = str(e)
-        trace = traceback.format_exc()
-        print(f"TFLite to C++ conversion error: {error_msg}")
-        print(trace)
-        return jsonify({
-            'error': error_msg,
-            'traceback': trace
-        }), 500
-
-def convert_to_cpp_python(tflite_path, tflite_filename):
-    """使用Python实现xxd -i的功能"""
-    try:
-        # 生成C++文件名
-        base_name = os.path.splitext(tflite_filename)[0]
-        cpp_filename = f"{base_name}.cc"
-        cpp_path = os.path.join(app.config['OUTPUT_FOLDER'], cpp_filename)
-        
-        # 读取TFLite文件
-        with open(tflite_path, 'rb') as f:
-            data = f.read()
-        
-        # 生成变量名（替换非字母数字字符为下划线）
-        var_name = os.path.splitext(os.path.basename(tflite_filename))[0]
-        var_name = ''.join(c if c.isalnum() else '_' for c in var_name)
-        
-        # 生成C++代码
-        cpp_content = []
-        cpp_content.append(f"unsigned char {var_name}[] = {{")
-        
-        # 每行16个字节
-        for i in range(0, len(data), 16):
-            chunk = data[i:i+16]
-            hex_values = [f"0x{b:02x}" for b in chunk]
-            line = "  " + ", ".join(hex_values)
-            if i + 16 < len(data):
-                line += ","
-            cpp_content.append(line)
-        
-        cpp_content.append("};")
-        cpp_content.append(f"unsigned int {var_name}_len = {len(data)};")
-        
-        # 保存C++文件
-        with open(cpp_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(cpp_content))
-        
-        # 获取文件大小
-        tflite_size = os.path.getsize(tflite_path)
-        cpp_size = os.path.getsize(cpp_path)
-        
-        return jsonify({
-            'success': True,
-            'cpp_filename': cpp_filename,
-            'tflite_size': tflite_size,
-            'cpp_size': cpp_size,
-            'message': 'TFLite模型已成功转换为C++文件（使用Python实现）'
-        })
-        
-    except Exception as e:
-        error_msg = str(e)
-        trace = traceback.format_exc()
-        print(f"Python TFLite to C++ conversion error: {error_msg}")
-        print(trace)
-        return jsonify({
-            'error': error_msg,
-            'traceback': trace
-        }), 500
-
-@app.route('/visualize/<filename>')
-def visualize_model(filename):
-    """生成模型可视化"""
-    try:
-        onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        
-        if not os.path.exists(onnx_path):
-            return jsonify({'error': 'Model file not found'}), 404
-        
-        # 使用 netron 生成可视化数据
-        # 这里返回一个简化的图结构
-        model = onnx.load(onnx_path)
-        graph = model.graph
-        
-        nodes_data = []
-        edges_data = []
-        
-        for i, node in enumerate(graph.node):
-            nodes_data.append({
-                'id': f"node_{i}",
-                'label': f"{node.op_type}\n{node.name or f'Node_{i}'}",
-                'op_type': node.op_type
-            })
+        with contextlib.redirect_stdout(log_capture_string), contextlib.redirect_stderr(log_capture_string):
+            data = request.json
+            onnx_filename = data.get('filename')
+            settings = data.get('settings', {})
             
-            # 创建边
-            for inp in node.input:
-                edges_data.append({
-                    'from': inp,
-                    'to': f"node_{i}"
-                })
-        
-        return jsonify({
-            'nodes': nodes_data[:100],  # 限制节点数量
-            'edges': edges_data[:200]   # 限制边数量
-        })
-        
+            if not onnx_filename:
+                 return jsonify({'error': 'No model loaded'}), 400
+                 
+            onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
+            tflite_filename = os.path.splitext(onnx_filename)[0] + ".tflite"
+            tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], tflite_filename)
+            
+            # --- Configuration Mapping ---
+            config = ConversionConfig()
+            
+            # Boolean Flags
+            config.allow_inputs_stripping = settings.get('allowInputsStripping', False)
+            config.keep_io_format = settings.get('keepIoFormat', False)
+            config.skip_shape_inference = settings.get('skipShapeInference', False)
+            config.qdq_aware_conversion = settings.get('qdqAwareConversion', False)
+            config.allow_select_ops = settings.get('allowSelectOps', False)
+            config.generate_artifacts_after_failed_shape_inference = settings.get('generateArtifacts', False)
+            config.non_negative_indices = settings.get('guaranteeNonNegative', False)
+            config.cast_int64_to_int32 = settings.get('castInt64ToInt32', False)
+            config.accept_resize_rounding_error = settings.get('acceptResizeError', False)
+            config.ignore_opset_version = settings.get('skipOpsetCheck', False)
+            config.dont_skip_nodes_with_known_outputs = settings.get('dontSkipUnknown', False)
+            
+            # Mappings
+            sym_dims = settings.get('symbolicDims', '')
+            if sym_dims:
+                mapping = {}
+                try:
+                    for pair in sym_dims.split(','):
+                        if ':' in pair: s = ':'
+                        elif '=' in pair: s = '='
+                        else: continue
+                        k, v = pair.split(s)
+                        mapping[k.strip()] = int(v.strip())
+                    config.symbolic_dimensions_mapping = mapping
+                except Exception as e:
+                    print(f"Error parsing symbolic dims: {e}")
+
+            # Input Shapes
+            input_shapes = settings.get('inputShapes', '')
+            if input_shapes:
+                 pass
+
+            start_time = datetime.now()
+            tflite_model = convert.convert_model(onnx_path, config)
+            
+            with open(tflite_path, 'wb') as f:
+                f.write(tflite_model)
+                
+            duration = (datetime.now() - start_time).total_seconds()
+            onnx_size = os.path.getsize(onnx_path)
+            tflite_size = os.path.getsize(tflite_path)
+            
+            # Perform accuracy comparison
+            print("\nComparing model accuracy...")
+            accuracy_metrics = compare_model_accuracy(onnx_path, tflite_path, num_samples=100)
+            
+            result = {
+                'success': True,
+                'tflite_filename': tflite_filename,
+                'stats': {
+                    'original_size': onnx_size,
+                    'converted_size': tflite_size,
+                    'ratio': f"{(1 - tflite_size/onnx_size)*100:.1f}%",
+                    'time': f"{duration:.2f}s"
+                },
+                'logs': log_capture_string.getvalue()
+            }
+            
+            if accuracy_metrics:
+                result['accuracy'] = accuracy_metrics
+                # Update time to show inference time if available
+                if 'avg_inference_time_us' in accuracy_metrics:
+                    result['stats']['time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
+                print(f"Accuracy comparison completed: {accuracy_metrics['num_samples']} samples")
+            else:
+                print("Accuracy comparison skipped or failed")
+            
+            return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        traceback.print_exc(file=log_capture_string)
+        return jsonify({'error': str(e), 'logs': log_capture_string.getvalue()}), 500
+
+@app.route('/quantize', methods=['POST'])
+def quantize_model():
+    """Perform QDQ Quantization then Conversion"""
+    log_capture_string = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(log_capture_string), contextlib.redirect_stderr(log_capture_string):
+            data = request.json
+            onnx_filename = data.get('filename')
+            settings = data.get('settings', {})
+            selected_layers = data.get('selectedLayers', [])
+            calib_filename = data.get('calibFilename')
+            
+            onnx_path = os.path.join(app.config['UPLOAD_FOLDER'], onnx_filename)
+            base_name = os.path.splitext(onnx_filename)[0]
+            q_onnx_path = os.path.join(app.config['OUTPUT_FOLDER'], f"{base_name}_quantized.onnx")
+            q_tflite_filename = f"{base_name}_quantized.tflite"
+            q_tflite_path = os.path.join(app.config['OUTPUT_FOLDER'], q_tflite_filename)
+            
+            onnx_model = onnx.load(onnx_path)
+            
+            # --- Prepare Calibration Data ---
+            calibration_reader = None
+            
+            if calib_filename:
+                # Process ZIP file
+                zip_path = os.path.join(app.config['UPLOAD_FOLDER'], calib_filename)
+                input_data_map = {} # {input_name: [arr1, arr2]}
+                
+                # Helper to guess input name from filename (naive)
+                # Or assume mapping provided? For now, we load all .npy and if single input model, assign all.
+                # If multi-input, we probably need a mapping from UI, but for "RealDataCalibrationDataReader" logic:
+                
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with zipfile.ZipFile(zip_path, 'r') as z:
+                        z.extractall(temp_dir)
+                        
+                    count = 0 
+                    # Find all npy
+                    for root, dirs, files in os.walk(temp_dir):
+                        for f in files:
+                            if f.endswith('.npy'):
+                                # Naive: assume filename contains input name or just collect all
+                                # Better approach: UI should probably specify input mappings if strict.
+                                # Fallback: Just load them all into a list and try to feed.
+                                 
+                                # Actually, RandomDataCalibrationDataReader generates a batch dict.
+                                # So real reader must do same.
+                                
+                                # Let's inspect model inputs to match
+                                model_inputs = [i.name for i in onnx_model.graph.input]
+                                
+                                try:
+                                    arr = np.load(os.path.join(root, f))
+                                    # Ensure batch dim exist if needed, etc.
+                                    
+                                    # Heuristic: if model has 1 input, assign all npy to it
+                                    if len(model_inputs) >= 1:
+                                        target_input = model_inputs[0] # Default to first
+                                        # If filename matches another input, switch
+                                        for inp in model_inputs:
+                                            if inp in f:
+                                                target_input = inp
+                                                
+                                        if target_input not in input_data_map:
+                                            input_data_map[target_input] = []
+                                        input_data_map[target_input].append(arr)
+                                        count += 1
+                                except:
+                                    pass
+                                    
+                if count > 0:
+                    print(f"Loaded {count} calibration samples")
+                    calibration_reader = RealDataCalibrationDataReader(input_data_map)
+            
+            if not calibration_reader:
+                 # Fallback to random if no zip or empty zip
+                  # Simplified creating random data logic inline for robustness
+                inputs = {}
+                for input_info in onnx_model.graph.input:
+                    dims = [d.dim_value if d.dim_value > 0 else 1 for d in input_info.type.tensor_type.shape.dim]
+                    inputs[input_info.name] = InputSpec(dims, np.float32)
+                
+                from onnx2quant.qdq_quantization import RandomDataCalibrationDataReader
+                calibration_reader = RandomDataCalibrationDataReader(inputs, num_samples=5)
+                print("Using Random Calibration Data")
+
+            # --- Quantization Config ---
+            q_config = QuantizationConfig(calibration_reader)
+            q_config.per_channel = settings.get('perChannel', False)
+            q_config.allow_opset_10_and_lower = settings.get('allowOpset10', False)
+            
+            # Helper to parse symbolic dims
+            sym_dims = settings.get('symbolicDims', '').strip()
+            if sym_dims:
+                try:
+                    mapping = {}
+                    for pair in sym_dims.split(','):
+                        if ':' in pair: s = ':'
+                        elif '=' in pair: s = '='
+                        else: continue
+                        k, v = pair.split(s)
+                        mapping[k.strip()] = int(v.strip())
+                    q_config.symbolic_dimensions_mapping = mapping
+                except Exception as e:
+                    print(f"Error parsing symbolic dims for quantization: {e}")
+            else:
+                 # Auto-populate symbolic dims for random calibration if not provided
+                 # This helps when using random data which assumes static shapes
+                 mapping = {}
+                 for i in onnx_model.graph.input:
+                     for d in i.type.tensor_type.shape.dim:
+                         if d.dim_param:
+                             mapping[d.dim_param] = 1 # Default to 1
+                 if mapping:
+                     print(f"Auto-setting symbolic dims to 1 for quantization: {mapping}")
+                     q_config.symbolic_dimensions_mapping = mapping
+
+            # Start timing
+            start_time = datetime.now()
+            
+            quantizer = QDQQuantizer(
+               op_types_to_quantize=selected_layers if selected_layers else None
+            )
+            
+            # Some flags might need to be applied pre-quantization or handling manually if library doesn't support direct flag
+            # But let's assume standard flow.
+            
+            q_onnx_model = quantizer.quantize_model(onnx_model, q_config)
+            
+            # Optional: Replace Div with Mul if requested (This usually happens before or during?)
+            # Since I don't have the exact source of 'replace_div_with_mul' accessible easily right here without looking deep, 
+            # I will assume the user wants the standard path provided by the tool.
+            
+            onnx.save(q_onnx_model, q_onnx_path)
+            
+            # --- Convert Quantized ONNX to TFLite ---
+            conv_config = ConversionConfig()
+            conv_config.qdq_aware_conversion = True # Force this for quantized models
+            
+            # Copy other compatible settings
+            conv_config.keep_io_format = settings.get('keepIoFormat', False)
+            
+            tflite_model = convert.convert_model(q_onnx_path, conv_config)
+            
+            with open(q_tflite_path, 'wb') as f:
+                f.write(tflite_model)
+            
+            # Calculate statistics
+            duration = (datetime.now() - start_time).total_seconds()
+            onnx_size = os.path.getsize(onnx_path)
+            q_onnx_size = os.path.getsize(q_onnx_path)
+            q_tflite_size = os.path.getsize(q_tflite_path)
+            
+            # Prepare test data for accuracy comparison
+            test_data_for_comparison = None
+            if calib_filename:
+                # Reuse calibration data for accuracy comparison
+                zip_path = os.path.join(app.config['UPLOAD_FOLDER'], calib_filename)
+                try:
+                    input_data_map = {}
+                    model_inputs = [i.name for i in onnx_model.graph.input]
+                    
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        with zipfile.ZipFile(zip_path, 'r') as z:
+                            z.extractall(temp_dir)
+                        
+                        for root, dirs, files in os.walk(temp_dir):
+                            for f in files:
+                                if f.endswith('.npy'):
+                                    try:
+                                        arr = np.load(os.path.join(root, f))
+                                        if len(model_inputs) >= 1:
+                                            target_input = model_inputs[0]
+                                            for inp in model_inputs:
+                                                if inp in f:
+                                                    target_input = inp
+                                            
+                                            if target_input not in input_data_map:
+                                                input_data_map[target_input] = []
+                                            # Copy the array to ensure it persists after temp_dir is deleted
+                                            input_data_map[target_input].append(arr.copy())
+                                    except Exception as e:
+                                        print(f"Error loading {f}: {e}")
+                                        pass
+                    
+                    if input_data_map:
+                        test_data_for_comparison = input_data_map
+                        print(f"Using {len(list(input_data_map.values())[0])} calibration samples for accuracy comparison")
+                except Exception as e:
+                    print(f"Could not load calibration data for comparison: {e}")
+            
+            # Perform accuracy comparison (compare original ONNX vs quantized TFLite)
+            print("\nComparing quantized model accuracy (original ONNX vs quantized TFLite)...")
+            accuracy_metrics = compare_model_accuracy(
+                onnx_path,  # Use original ONNX model, not quantized
+                q_tflite_path, 
+                test_data=test_data_for_comparison,
+                num_samples=100
+            )
+            
+            result = {
+                'success': True,
+                'quantized_tflite_filename': q_tflite_filename,
+                'quantized_onnx_filename': os.path.basename(q_onnx_path),
+                'stats': {
+                    'original_size': onnx_size,
+                    'quantized_onnx_size': q_onnx_size,
+                    'converted_size': q_tflite_size,
+                    'ratio': f"{(1 - q_tflite_size/onnx_size)*100:.1f}%",
+                    'time': f"{duration:.2f}s"
+                },
+                'logs': log_capture_string.getvalue()
+            }
+            
+            if accuracy_metrics:
+                result['accuracy'] = accuracy_metrics
+                # Update time to show inference time if available
+                if 'avg_inference_time_us' in accuracy_metrics:
+                    result['stats']['time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
+                print(f"Accuracy comparison completed: {accuracy_metrics['num_samples']} samples")
+            else:
+                print("Accuracy comparison skipped or failed")
+                
+            return jsonify(result)
+
+    except Exception as e:
+        traceback.print_exc(file=log_capture_string)
+        return jsonify({'error': str(e), 'logs': log_capture_string.getvalue()}), 500
+
+@app.route('/download/<filename>')
+def download(filename):
+    return send_file(os.path.join(app.config['OUTPUT_FOLDER'], filename), as_attachment=True)
+
+@app.route('/download_calib_generator')
+def download_calib_generator():
+    """Generate and download a Python script for training model and creating calibration data"""
+    script_content = '''#!/usr/bin/env python3
+"""
+模型训练与校准数据生成器
+Train PyTorch models, export to ONNX, and generate calibration data for quantization
+
+使用方法 (Usage):
+    # 训练MLP模型并导出
+    python train_and_calibrate.py --model mlp --epochs 50 --num_samples 100
+    
+    # 训练CNN模型
+    python train_and_calibrate.py --model cnn --epochs 20 --batch_size 32
+    
+    # 训练多输入模型
+    python train_and_calibrate.py --model multi_input --epochs 30
+    
+    # 训练Transformer模型
+    python train_and_calibrate.py --model transformer --epochs 10 --num_samples 50
+
+参数说明 (Arguments):
+    --model: 模型类型 (mlp, cnn, resnet, transformer, multi_input)
+    --epochs: 训练轮数 (default: 50)
+    --batch_size: 批次大小 (default: 32)
+    --lr: 学习率 (default: 0.001)
+    --num_samples: 校准数据样本数量 (default: 100)
+    --output_dir: 输出目录 (default: model_outputs)
+    --skip_training: 跳过训练，仅生成校准数据
+"""
+
+import argparse
+import os
+import sys
+import inspect
+import numpy as np
+import zipfile
+import shutil
+from pathlib import Path
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
+    import onnx
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("Error: PyTorch not installed. Please install: pip install torch onnx")
+    sys.exit(1)
+
+
+# ===========================
+# Model Definitions
+# ===========================
+
+class MLPModel(nn.Module):
+    """Fully Connected Neural Network (MLP)"""
+    def __init__(self, input_size=10, hidden_size=64, output_size=2):
+        super(MLPModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.relu2 = nn.ReLU()
+        self.fc3 = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class CNNModel(nn.Module):
+    """Convolutional Neural Network for Image Classification"""
+    def __init__(self, num_classes=10):
+        super(CNNModel, self).__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(64 * 8 * 8, 128)
+        self.relu3 = nn.ReLU()
+        self.fc2 = nn.Linear(128, num_classes)
+    
+    def forward(self, x):
+        x = self.pool1(self.relu1(self.conv1(x)))
+        x = self.pool2(self.relu2(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        x = self.relu3(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class SimpleResNet(nn.Module):
+    """Simple ResNet-like model"""
+    def __init__(self, num_classes=10):
+        super(SimpleResNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Residual block
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, num_classes)
+    
+    def forward(self, x):
+        identity = self.relu(self.bn1(self.conv1(x)))
+        
+        out = self.conv2(identity)
+        out = self.bn2(out)
+        out += identity  # Skip connection
+        out = self.relu(out)
+        
+        out = self.pool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+
+class TransformerModel(nn.Module):
+    """Simple Transformer model for sequence classification"""
+    def __init__(self, vocab_size=10000, embed_dim=128, num_heads=4, num_classes=2, seq_len=64):
+        super(TransformerModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.fc = nn.Linear(embed_dim, num_classes)
+    
+    def forward(self, x):
+        x = self.embedding(x) + self.pos_encoding
+        x = self.transformer(x)
+        x = x.mean(dim=1)  # Global average pooling
+        x = self.fc(x)
+        return x
+
+
+class MultiInputModel(nn.Module):
+    """Multi-input model example"""
+    def __init__(self):
+        super(MultiInputModel, self).__init__()
+        self.fc1 = nn.Linear(10, 32)
+        self.fc2 = nn.Linear(5, 32)
+        self.fc3 = nn.Linear(64, 2)
+        self.relu = nn.ReLU()
+    
+    def forward(self, input1, input2):
+        x1 = self.relu(self.fc1(input1))
+        x2 = self.relu(self.fc2(input2))
+        x = torch.cat([x1, x2], dim=1)
+        x = self.fc3(x)
+        return x
+
+
+# ===========================
+# Training Functions
+# ===========================
+
+def create_dummy_dataset(model_type, num_samples=1000, batch_size=32):
+    """Create dummy dataset for training"""
+    print(f"Creating dummy dataset: {num_samples} samples, batch_size={batch_size}")
+    
+    if model_type == 'mlp':
+        X = torch.randn(num_samples, 10)
+        y = torch.randint(0, 2, (num_samples,))
+        dataset = TensorDataset(X, y)
+        
+    elif model_type in ['cnn', 'resnet']:
+        X = torch.randn(num_samples, 3, 32, 32)
+        y = torch.randint(0, 10, (num_samples,))
+        dataset = TensorDataset(X, y)
+        
+    elif model_type == 'transformer':
+        X = torch.randint(0, 10000, (num_samples, 64))
+        y = torch.randint(0, 2, (num_samples,))
+        dataset = TensorDataset(X, y)
+        
+    elif model_type == 'multi_input':
+        X1 = torch.randn(num_samples, 10)
+        X2 = torch.randn(num_samples, 5)
+        y = torch.randint(0, 2, (num_samples,))
+        dataset = TensorDataset(X1, X2, y)
+    
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return dataloader
+
+
+def train_model(model, dataloader, model_type, epochs=50, lr=0.001):
+    """Train the model"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    print(f"\\n{'='*60}")
+    print(f"Training {model_type.upper()} model")
+    print(f"Device: {device}")
+    print(f"Epochs: {epochs}, Learning Rate: {lr}")
+    print(f"{'='*60}\\n")
+    
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        for batch_idx, batch in enumerate(dataloader):
+            if model_type == 'multi_input':
+                input1, input2, targets = batch
+                input1, input2, targets = input1.to(device), input2.to(device), targets.to(device)
+                outputs = model(input1, input2)
+            else:
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+            
+            loss = criterion(outputs, targets)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+        
+        avg_loss = total_loss / len(dataloader)
+        accuracy = 100. * correct / total
+        
+        if (epoch + 1) % max(1, epochs // 10) == 0:
+            print(f'Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+    
+    print(f"\\n✓ Training completed!")
+    return model
+
+
+def export_onnx(model, dummy_input, onnx_path, input_names, output_names, dynamic_axes=None):
+    """Export PyTorch model to ONNX format"""
+    model.eval()
+    model.cpu()
+    
+    print(f"\\nExporting model to ONNX: {onnx_path}")
+    
+    kwargs = {
+        'export_params': True,
+        'opset_version': 11,
+        'do_constant_folding': True,
+        'input_names': input_names,
+        'output_names': output_names,
+    }
+    
+    if dynamic_axes:
+        kwargs['dynamic_axes'] = dynamic_axes
+    
+    # Add external_data=False if supported
+    sig = inspect.signature(torch.onnx.export)
+    if 'external_data' in sig.parameters:
+        kwargs['external_data'] = False
+    
+    torch.onnx.export(model, dummy_input, onnx_path, **kwargs)
+    
+    # Verify
+    onnx_model = onnx.load(onnx_path)
+    onnx.checker.check_model(onnx_model)
+    
+    file_size = os.path.getsize(onnx_path) / 1024 / 1024
+    print(f"✓ ONNX model exported successfully: {file_size:.2f} MB")
+
+
+def generate_calibration_data(model, model_type, num_samples, output_dir):
+    """Generate calibration data from model"""
+    print(f"\\n{'='*60}")
+    print(f"Generating calibration data")
+    print(f"Samples: {num_samples}")
+    print(f"{'='*60}\\n")
+    
+    model.eval()
+    model.cpu()
+    
+    temp_dir = os.path.join(output_dir, "temp_calib")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    try:
+        with torch.no_grad():
+            if model_type == 'mlp':
+                input_data = torch.randn(num_samples, 10).numpy()
+                for i in range(num_samples):
+                    np.save(os.path.join(temp_dir, f"input_sample_{i:04d}.npy"), 
+                           input_data[i:i+1].astype(np.float32))
+                    
+            elif model_type in ['cnn', 'resnet']:
+                input_data = torch.randn(num_samples, 3, 32, 32).numpy()
+                for i in range(num_samples):
+                    np.save(os.path.join(temp_dir, f"input_sample_{i:04d}.npy"), 
+                           input_data[i:i+1].astype(np.float32))
+                    
+            elif model_type == 'transformer':
+                input_data = torch.randint(0, 10000, (num_samples, 64)).numpy()
+                for i in range(num_samples):
+                    np.save(os.path.join(temp_dir, f"input_sample_{i:04d}.npy"), 
+                           input_data[i:i+1].astype(np.int32))
+                    
+            elif model_type == 'multi_input':
+                input1_data = torch.randn(num_samples, 10).numpy()
+                input2_data = torch.randn(num_samples, 5).numpy()
+                for i in range(num_samples):
+                    np.save(os.path.join(temp_dir, f"input1_sample_{i:04d}.npy"), 
+                           input1_data[i:i+1].astype(np.float32))
+                    np.save(os.path.join(temp_dir, f"input2_sample_{i:04d}.npy"), 
+                           input2_data[i:i+1].astype(np.float32))
+        
+        # Create ZIP file
+        zip_path = os.path.join(output_dir, "calibration_data.zip")
+        print(f"Creating ZIP archive: {zip_path}")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith('.npy'):
+                        file_path = os.path.join(root, file)
+                        zipf.write(file_path, os.path.basename(file_path))
+        
+        # Statistics
+        npy_files = [f for f in os.listdir(temp_dir) if f.endswith('.npy')]
+        zip_size = os.path.getsize(zip_path) / 1024
+        
+        print(f"\\n✓ Calibration data generated!")
+        print(f"  Files: {len(npy_files)} .npy files")
+        print(f"  ZIP size: {zip_size:.2f} KB")
+        
+    finally:
+        # Cleanup
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+# ===========================
+# Main Pipeline
+# ===========================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='训练PyTorch模型并生成ONNX和校准数据',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--model', type=str, default='mlp',
+                       choices=['mlp', 'cnn', 'resnet', 'transformer', 'multi_input'],
+                       help='模型类型 (default: mlp)')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='训练轮数 (default: 50)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='批次大小 (default: 32)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                       help='学习率 (default: 0.001)')
+    parser.add_argument('--num_samples', type=int, default=100,
+                       help='校准数据样本数 (default: 100)')
+    parser.add_argument('--output_dir', type=str, default='model_outputs',
+                       help='输出目录 (default: model_outputs)')
+    parser.add_argument('--skip_training', action='store_true',
+                       help='跳过训练，仅生成校准数据')
+    
+    args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    print(f"\\n{'='*60}")
+    print(f"模型训练与校准数据生成器")
+    print(f"{'='*60}")
+    print(f"模型类型: {args.model}")
+    print(f"输出目录: {args.output_dir}")
+    print(f"{'='*60}\\n")
+    
+    # Create model
+    if args.model == 'mlp':
+        model = MLPModel()
+        dummy_input = torch.randn(1, 10)
+        input_names = ['input']
+        output_names = ['output']
+        dynamic_axes = {'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        
+    elif args.model == 'cnn':
+        model = CNNModel()
+        dummy_input = torch.randn(1, 3, 32, 32)
+        input_names = ['input']
+        output_names = ['output']
+        dynamic_axes = {'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        
+    elif args.model == 'resnet':
+        model = SimpleResNet()
+        dummy_input = torch.randn(1, 3, 32, 32)
+        input_names = ['input']
+        output_names = ['output']
+        dynamic_axes = {'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        
+    elif args.model == 'transformer':
+        model = TransformerModel()
+        dummy_input = torch.randint(0, 10000, (1, 64))
+        input_names = ['input']
+        output_names = ['output']
+        dynamic_axes = {'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        
+    elif args.model == 'multi_input':
+        model = MultiInputModel()
+        dummy_input = (torch.randn(1, 10), torch.randn(1, 5))
+        input_names = ['input1', 'input2']
+        output_names = ['output']
+        dynamic_axes = {
+            'input1': {0: 'batch_size'}, 
+            'input2': {0: 'batch_size'},
+            'output': {0: 'batch_size'}
+        }
+    
+    # Training
+    if not args.skip_training:
+        dataloader = create_dummy_dataset(args.model, num_samples=1000, batch_size=args.batch_size)
+        model = train_model(model, dataloader, args.model, epochs=args.epochs, lr=args.lr)
+        
+        # Save PyTorch model
+        model_path = os.path.join(args.output_dir, f"{args.model}_model.pth")
+        torch.save(model.state_dict(), model_path)
+        print(f"\\n✓ PyTorch model saved: {model_path}")
+    else:
+        print("\\n⚠ Skipping training (--skip_training flag)")
+    
+    # Export to ONNX
+    onnx_path = os.path.join(args.output_dir, f"{args.model}_model.onnx")
+    export_onnx(model, dummy_input, onnx_path, input_names, output_names, dynamic_axes)
+    
+    # Generate calibration data
+    generate_calibration_data(model, args.model, args.num_samples, args.output_dir)
+    
+    print(f"\\n{'='*60}")
+    print(f"✓ All tasks completed!")
+    print(f"{'='*60}")
+    print(f"\\n输出文件:")
+    print(f"  - ONNX 模型: {onnx_path}")
+    print(f"  - 校准数据: {os.path.join(args.output_dir, 'calibration_data.zip')}")
+    if not args.skip_training:
+        print(f"  - PyTorch 模型: {model_path}")
+    print(f"\\n使用示例:")
+    print(f"  上传 {args.model}_model.onnx 到 Web 界面进行转换")
+    print(f"  上传 calibration_data.zip 用于量化")
+    print(f"{'='*60}\\n")
+
 
 if __name__ == '__main__':
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+    main()
+'''
     
-    # 启动文件清理定时器
+    # Save to temporary file and send
+    script_filename = 'train_and_calibrate.py'
+    script_path = os.path.join(app.config['OUTPUT_FOLDER'], script_filename)
+    
+    with open(script_path, 'w', encoding='utf-8') as f:
+        f.write(script_content)
+    
+    return send_file(script_path, as_attachment=True, download_name=script_filename)
+
+@app.route('/convert_to_cpp', methods=['POST'])
+def convert_to_cpp():
+    try:
+        data = request.json
+        filename = data.get('filename')
+        file_path = os.path.join(app.config['OUTPUT_FOLDER'], filename)
+        
+        if not os.path.exists(file_path):
+             return jsonify({'error': 'File not found'}), 404
+             
+        cpp_filename = os.path.splitext(filename)[0] + ".cc"
+        cpp_path = os.path.join(app.config['OUTPUT_FOLDER'], cpp_filename)
+        
+        with open(file_path, 'rb') as f:
+            content = f.read()
+            
+        var_name = "model_data"
+        hex_data = ", ".join([f"0x{b:02x}" for b in content])
+        cpp_code = f"unsigned char {var_name}[] = {{{hex_data}}};\nunsigned int {var_name}_len = {len(content)};"
+        
+        with open(cpp_path, 'w') as f:
+            f.write(cpp_code)
+            
+        return jsonify({'success': True, 'cpp_filename': cpp_filename})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
     start_cleanup_timer()
-    
     app.run(host='0.0.0.0', port=5000, debug=True)

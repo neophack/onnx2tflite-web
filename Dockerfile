@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --no-cache-dir \
     flask==3.0.0 \
     werkzeug==3.0.1 \
-    --extra-index-url https://eiq.nxp.com/repository/ eiq-onnx2tflite==0.7.0 \
+    --extra-index-url https://eiq.nxp.com/repository/ eiq-onnx2tflite==0.8.0 \
     onnx==1.17.0 \
     netron==8.7.7 \
     pillow==10.1.0 \
