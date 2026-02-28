@@ -272,6 +272,13 @@ def start_cleanup_timer():
 def get_model_info(onnx_path):
     try:
         model = onnx.load(onnx_path)
+        
+        # Try to infer shapes for better visualization
+        try:
+            model = shape_inference.infer_shapes(model)
+        except Exception:
+            pass  # Continue even if shape inference fails
+        
         graph = model.graph
         
         info = {
@@ -282,8 +289,14 @@ def get_model_info(onnx_path):
             'outputs': [],
             'node_count': len(graph.node),
             'node_types': {},
+            'nodes': [],
+            'edges': []
         }
         
+        # Build tensor shape map from value_info
+        tensor_shapes = {}
+        
+        # Get model inputs with shapes
         for inp in graph.input:
             shape = []
             for dim in inp.type.tensor_type.shape.dim:
@@ -293,7 +306,10 @@ def get_model_info(onnx_path):
                 'type': str(inp.type.tensor_type.elem_type),
                 'shape': shape
             })
-            
+            tensor_shapes[inp.name] = shape
+        
+        # Get model outputs with shapes
+        output_names = set()
         for out in graph.output:
             shape = []
             for dim in out.type.tensor_type.shape.dim:
@@ -303,10 +319,92 @@ def get_model_info(onnx_path):
                 'type': str(out.type.tensor_type.elem_type),
                 'shape': shape
             })
+            output_names.add(out.name)
+            tensor_shapes[out.name] = shape
+        
+        # Get intermediate tensor shapes from value_info
+        for value_info in graph.value_info:
+            shape = []
+            try:
+                for dim in value_info.type.tensor_type.shape.dim:
+                    shape.append(dim.dim_param if dim.dim_param else dim.dim_value)
+                tensor_shapes[value_info.name] = shape
+            except Exception:
+                pass
+        
+        # Build tensor producer map (which node produces which tensor)
+        tensor_producer = {}
+        input_names = set(inp['name'] for inp in info['inputs'])
+        
+        # Map inputs to their pseudo-nodes
+        for inp_name in input_names:
+            tensor_producer[inp_name] = f"input_{inp_name}"
+        
+        # Get detailed node info and build edges
+        for idx, node in enumerate(graph.node):
+            node_id = f"node_{idx}_{node.name if node.name else node.op_type}"
             
-        for node in graph.node:
+            # Count node types
             info['node_types'][node.op_type] = info['node_types'].get(node.op_type, 0) + 1
             
+            # Get attributes
+            attributes = {}
+            for attr in node.attribute:
+                try:
+                    if attr.HasField('f'):
+                        attributes[attr.name] = float(attr.f)
+                    elif attr.HasField('i'):
+                        attributes[attr.name] = int(attr.i)
+                    elif attr.HasField('s'):
+                        attributes[attr.name] = attr.s.decode('utf-8') if attr.s else ''
+                    elif attr.floats:
+                        attributes[attr.name] = list(attr.floats)
+                    elif attr.ints:
+                        attributes[attr.name] = list(attr.ints)
+                except Exception:
+                    attributes[attr.name] = str(attr)
+            
+            # Add node info
+            info['nodes'].append({
+                'id': node_id,
+                'name': node.name if node.name else f"{node.op_type}_{idx}",
+                'op_type': node.op_type,
+                'inputs': list(node.input),
+                'outputs': list(node.output),
+                'attributes': attributes
+            })
+            
+            # Map outputs to this node
+            for output in node.output:
+                tensor_producer[output] = node_id
+            
+            # Create edges from inputs to this node
+            for input_tensor in node.input:
+                if input_tensor in tensor_producer:
+                    from_node = tensor_producer[input_tensor]
+                    info['edges'].append({
+                        'from': from_node,
+                        'to': node_id,
+                        'tensor': input_tensor
+                    })
+        
+        # Connect output nodes to the nodes that produce them
+        for output_info in info['outputs']:
+            output_name = output_info['name']
+            output_node_id = f"output_{output_name}"
+            
+            # Find which node produces this output
+            if output_name in tensor_producer:
+                from_node = tensor_producer[output_name]
+                info['edges'].append({
+                    'from': from_node,
+                    'to': output_node_id,
+                    'tensor': output_name
+                })
+        
+        # Add tensor shapes to info
+        info['tensor_shapes'] = tensor_shapes
+        
         return info
     except Exception as e:
         return {'error': str(e)}
@@ -417,6 +515,21 @@ def convert_model():
                     config.symbolic_dimensions_mapping = mapping
                 except Exception as e:
                     print(f"Error parsing symbolic dims: {e}")
+            else:
+                # Auto-populate symbolic dims with default value of 50 if not provided
+                try:
+                    onnx_model = onnx.load(onnx_path)
+                    mapping = {}
+                    for inp in onnx_model.graph.input:
+                        for dim in inp.type.tensor_type.shape.dim:
+                            if dim.dim_param:
+                                # Use 50 as default for sequence_length or other symbolic dims
+                                mapping[dim.dim_param] = 50
+                    if mapping:
+                        print(f"Auto-setting symbolic dims to 50 for conversion: {mapping}")
+                        config.symbolic_dimensions_mapping = mapping
+                except Exception as e:
+                    print(f"Error auto-setting symbolic dims: {e}")
 
             # Input Shapes
             input_shapes = settings.get('inputShapes', '')
@@ -575,9 +688,9 @@ def quantize_model():
                  for i in onnx_model.graph.input:
                      for d in i.type.tensor_type.shape.dim:
                          if d.dim_param:
-                             mapping[d.dim_param] = 1 # Default to 1
+                             mapping[d.dim_param] = 50 # Default to 50
                  if mapping:
-                     print(f"Auto-setting symbolic dims to 1 for quantization: {mapping}")
+                     print(f"Auto-setting symbolic dims to 50 for quantization: {mapping}")
                      q_config.symbolic_dimensions_mapping = mapping
 
             # Start timing

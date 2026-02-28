@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y vim-common  && rm -rf /var/lib/apt/list
 # 创建必要的目录
 RUN mkdir -p /app/uploads /app/outputs /app/static /app/templates
 
+RUN pip install netron
 # 复制应用文件
 
 COPY templates/ /app/templates/
