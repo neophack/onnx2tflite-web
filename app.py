@@ -62,7 +62,7 @@ class RealDataCalibrationDataReader:
     def rewind(self):
         self.current_index = 0
 
-def compare_model_accuracy(onnx_path, tflite_path, test_data=None, num_samples=100):
+def compare_model_accuracy(onnx_path, tflite_path, test_data=None, num_samples=100, symbolic_dimensions_mapping=None):
     """Compare accuracy between ONNX and TFLite models.
     
     Args:
@@ -70,6 +70,7 @@ def compare_model_accuracy(onnx_path, tflite_path, test_data=None, num_samples=1
         tflite_path: Path to TFLite model
         test_data: Optional dict {input_name: [arrays]} for calibration data
         num_samples: Number of random samples to generate if no test_data
+        symbolic_dimensions_mapping: Optional dict mapping symbolic dimension names to values
     
     Returns:
         dict with accuracy metrics or None if comparison failed
@@ -112,13 +113,30 @@ def compare_model_accuracy(onnx_path, tflite_path, test_data=None, num_samples=1
         
         if not test_data:
             # Generate random data
+            # Load ONNX model to get symbolic dimension names
+            onnx_model = onnx.load(onnx_path)
+            sym_dim_mapping = symbolic_dimensions_mapping if symbolic_dimensions_mapping else {}
+            
+            # Auto-detect symbolic dimensions if not provided
+            if not sym_dim_mapping:
+                for inp in onnx_model.graph.input:
+                    for dim in inp.type.tensor_type.shape.dim:
+                        if dim.dim_param and dim.dim_param not in sym_dim_mapping:
+                            sym_dim_mapping[dim.dim_param] = 50  # Default to 50
+            
             test_samples = []
             for _ in range(num_samples):
                 sample = {}
-                for inp in onnx_inputs:
-                    shape = [d if isinstance(d, int) else 1 for d in inp.shape]
-                    # Handle string dimensions
-                    shape = [s if s > 0 else 1 for s in shape]
+                for inp_idx, inp in enumerate(onnx_inputs):
+                    shape = []
+                    onnx_inp = onnx_model.graph.input[inp_idx]
+                    for dim_idx, dim in enumerate(onnx_inp.type.tensor_type.shape.dim):
+                        if dim.dim_param:  # Symbolic dimension
+                            shape.append(sym_dim_mapping.get(dim.dim_param, 50))
+                        elif dim.dim_value > 0:  # Concrete dimension
+                            shape.append(dim.dim_value)
+                        else:  # Unknown dimension
+                            shape.append(1)
                     sample[inp.name] = np.random.randn(*shape).astype(np.float32)
                 test_samples.append(sample)
         
@@ -548,7 +566,12 @@ def convert_model():
             
             # Perform accuracy comparison
             print("\nComparing model accuracy...")
-            accuracy_metrics = compare_model_accuracy(onnx_path, tflite_path, num_samples=100)
+            accuracy_metrics = compare_model_accuracy(
+                onnx_path, 
+                tflite_path, 
+                num_samples=100,
+                symbolic_dimensions_mapping=config.symbolic_dimensions_mapping
+            )
             
             result = {
                 'success': True,
@@ -564,9 +587,9 @@ def convert_model():
             
             if accuracy_metrics:
                 result['accuracy'] = accuracy_metrics
-                # Update time to show inference time if available
+                # Add inference time as a separate field instead of overwriting time
                 if 'avg_inference_time_us' in accuracy_metrics:
-                    result['stats']['time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
+                    result['stats']['inference_time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
                 print(f"Accuracy comparison completed: {accuracy_metrics['num_samples']} samples")
             else:
                 print("Accuracy comparison skipped or failed")
@@ -650,48 +673,60 @@ def quantize_model():
                     print(f"Loaded {count} calibration samples")
                     calibration_reader = RealDataCalibrationDataReader(input_data_map)
             
+            # --- Parse or Auto-generate Symbolic Dimensions Mapping FIRST ---
+            # This must be done before creating calibration data to ensure consistency
+            symbolic_dim_mapping = {}
+            sym_dims = settings.get('symbolicDims', '').strip()
+            if sym_dims:
+                try:
+                    for pair in sym_dims.split(','):
+                        if ':' in pair: s = ':'
+                        elif '=' in pair: s = '='
+                        else: continue
+                        k, v = pair.split(s)
+                        symbolic_dim_mapping[k.strip()] = int(v.strip())
+                    print(f"Using user-provided symbolic dims for quantization: {symbolic_dim_mapping}")
+                except Exception as e:
+                    print(f"Error parsing symbolic dims for quantization: {e}")
+            else:
+                 # Auto-populate symbolic dims with default value of 50 if not provided
+                 for i in onnx_model.graph.input:
+                     for d in i.type.tensor_type.shape.dim:
+                         if d.dim_param:
+                             symbolic_dim_mapping[d.dim_param] = 50 # Default to 50
+                 if symbolic_dim_mapping:
+                     print(f"Auto-setting symbolic dims to 50 for quantization: {symbolic_dim_mapping}")
+            
             if not calibration_reader:
                  # Fallback to random if no zip or empty zip
-                  # Simplified creating random data logic inline for robustness
+                 # Use the symbolic dimension mapping to create correct shapes
                 inputs = {}
                 for input_info in onnx_model.graph.input:
-                    dims = [d.dim_value if d.dim_value > 0 else 1 for d in input_info.type.tensor_type.shape.dim]
+                    dims = []
+                    for d in input_info.type.tensor_type.shape.dim:
+                        if d.dim_value > 0:
+                            # Use concrete dimension value
+                            dims.append(d.dim_value)
+                        elif d.dim_param and d.dim_param in symbolic_dim_mapping:
+                            # Use mapped symbolic dimension value
+                            dims.append(symbolic_dim_mapping[d.dim_param])
+                        else:
+                            # Fallback to 1 if no mapping available
+                            dims.append(1)
                     inputs[input_info.name] = InputSpec(dims, np.float32)
                 
                 from onnx2quant.qdq_quantization import RandomDataCalibrationDataReader
                 calibration_reader = RandomDataCalibrationDataReader(inputs, num_samples=5)
-                print("Using Random Calibration Data")
+                print(f"Using Random Calibration Data with shapes: {[(name, spec.shape) for name, spec in inputs.items()]}")
 
             # --- Quantization Config ---
             q_config = QuantizationConfig(calibration_reader)
             q_config.per_channel = settings.get('perChannel', False)
             q_config.allow_opset_10_and_lower = settings.get('allowOpset10', False)
             
-            # Helper to parse symbolic dims
-            sym_dims = settings.get('symbolicDims', '').strip()
-            if sym_dims:
-                try:
-                    mapping = {}
-                    for pair in sym_dims.split(','):
-                        if ':' in pair: s = ':'
-                        elif '=' in pair: s = '='
-                        else: continue
-                        k, v = pair.split(s)
-                        mapping[k.strip()] = int(v.strip())
-                    q_config.symbolic_dimensions_mapping = mapping
-                except Exception as e:
-                    print(f"Error parsing symbolic dims for quantization: {e}")
-            else:
-                 # Auto-populate symbolic dims for random calibration if not provided
-                 # This helps when using random data which assumes static shapes
-                 mapping = {}
-                 for i in onnx_model.graph.input:
-                     for d in i.type.tensor_type.shape.dim:
-                         if d.dim_param:
-                             mapping[d.dim_param] = 50 # Default to 50
-                 if mapping:
-                     print(f"Auto-setting symbolic dims to 50 for quantization: {mapping}")
-                     q_config.symbolic_dimensions_mapping = mapping
+            # Apply the symbolic dimensions mapping to quantization config
+            if symbolic_dim_mapping:
+                q_config.symbolic_dimensions_mapping = symbolic_dim_mapping
 
             # Start timing
             start_time = datetime.now()
@@ -773,7 +808,8 @@ def quantize_model():
                 onnx_path,  # Use original ONNX model, not quantized
                 q_tflite_path, 
                 test_data=test_data_for_comparison,
-                num_samples=100
+                num_samples=100,
+                symbolic_dimensions_mapping=q_config.symbolic_dimensions_mapping
             )
             
             result = {
@@ -792,9 +828,9 @@ def quantize_model():
             
             if accuracy_metrics:
                 result['accuracy'] = accuracy_metrics
-                # Update time to show inference time if available
+                # Add inference time as a separate field instead of overwriting time
                 if 'avg_inference_time_us' in accuracy_metrics:
-                    result['stats']['time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
+                    result['stats']['inference_time'] = f"{accuracy_metrics['avg_inference_time_us']:.2f}us"
                 print(f"Accuracy comparison completed: {accuracy_metrics['num_samples']} samples")
             else:
                 print("Accuracy comparison skipped or failed")
@@ -807,7 +843,15 @@ def quantize_model():
 
 @app.route('/download/<filename>')
 def download(filename):
-    return send_file(os.path.join(app.config['OUTPUT_FOLDER'], filename), as_attachment=True)
+    # Secure the filename to prevent path traversal attacks
+    safe_filename = secure_filename(filename)
+    file_path = os.path.join(app.config['OUTPUT_FOLDER'], safe_filename)
+    
+    # Verify the file exists and is within the output folder
+    if not os.path.exists(file_path) or not os.path.abspath(file_path).startswith(os.path.abspath(app.config['OUTPUT_FOLDER'])):
+        return jsonify({'error': 'File not found'}), 404
+    
+    return send_file(file_path, as_attachment=True)
 
 @app.route('/download_calib_generator')
 def download_calib_generator():
@@ -1286,12 +1330,16 @@ def convert_to_cpp():
     try:
         data = request.json
         filename = data.get('filename')
-        file_path = os.path.join(app.config['OUTPUT_FOLDER'], filename)
         
-        if not os.path.exists(file_path):
+        # Secure the filename to prevent path traversal attacks
+        safe_filename = secure_filename(filename)
+        file_path = os.path.join(app.config['OUTPUT_FOLDER'], safe_filename)
+        
+        # Verify the file exists and is within the output folder
+        if not os.path.exists(file_path) or not os.path.abspath(file_path).startswith(os.path.abspath(app.config['OUTPUT_FOLDER'])):
              return jsonify({'error': 'File not found'}), 404
              
-        cpp_filename = os.path.splitext(filename)[0] + ".cc"
+        cpp_filename = os.path.splitext(safe_filename)[0] + ".cc"
         cpp_path = os.path.join(app.config['OUTPUT_FOLDER'], cpp_filename)
         
         with open(file_path, 'rb') as f:

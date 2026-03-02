@@ -260,7 +260,7 @@
                         </div>
                     </div>
 
-                    <button class="btn btn-primary" id="quantizeBtn" style="background-color: var(--warning); border-color: var(--warning);">执行量化</button>
+                    <button class="btn btn-primary" id="quantizeBtn" style="background-color: var(--warning); border-color: var(--warning);" disabled>执行量化</button>
                 </div>
             </div>
         </div>
@@ -303,8 +303,12 @@
                              <span class="stat-val" id="resNew">-</span>
                         </div>
                          <div class="stat-row">
-                             <span>推理耗时（平均）</span>
+                             <span>转换耗时</span>
                              <span class="stat-val" id="resTime">-</span>
+                        </div>
+                         <div class="stat-row" id="inferenceTimeRow" style="display: none;">
+                             <span>推理耗时（平均）</span>
+                             <span class="stat-val" id="resInferenceTime">-</span>
                         </div>
                     </div>
                     
@@ -340,6 +344,170 @@
     </main>
 
     <script>
+        // Simplified graph layout implementation
+        window.dagre = {
+            Graph: function(options) {
+                this._nodes = {};
+                this._edges = [];
+                this._graph = {};
+                this._nodeEdgeLabel = () => ({});
+                
+                this.setGraph = function(opts) {
+                    this._graph = opts || {};
+                    return this;
+                };
+                
+                this.graph = function() {
+                    return this._graph;
+                };
+                
+                this.setDefaultEdgeLabel = function(fn) {
+                    this._nodeEdgeLabel = fn;
+                    return this;
+                };
+                
+                this.setNode = function(id, data) {
+                    this._nodes[id] = data || {};
+                    return this;
+                };
+                
+                this.node = function(id) {
+                    return this._nodes[id];
+                };
+                
+                this.nodes = function() {
+                    return Object.keys(this._nodes);
+                };
+                
+                this.setEdge = function(from, to, label) {
+                    this._edges.push({ v: from, w: to, label: label || this._nodeEdgeLabel() });
+                    return this;
+                };
+                
+                this.edge = function(edgeObj) {
+                    const found = this._edges.find(e => e.v === edgeObj.v && e.w === edgeObj.w);
+                    return found ? found.label : undefined;
+                };
+                
+                this.edges = function() {
+                    return this._edges;
+                };
+            },
+            
+            layout: function(g) {
+                const opts = g.graph() || {};
+                const ranksep = opts.ranksep || 100;
+                const nodesep = opts.nodesep || 80;
+                
+                // Build adjacency
+                const inDegree = {};
+                const outEdges = {};
+                const layers = {};
+                
+                g.nodes().forEach(id => {
+                    inDegree[id] = 0;
+                    outEdges[id] = [];
+                    layers[id] = 0;
+                });
+                
+                g.edges().forEach(edge => {
+                    outEdges[edge.v].push(edge.w);
+                    inDegree[edge.w]++;
+                });
+                
+                // Topological sort for layering
+                const queue = [];
+                g.nodes().forEach(id => {
+                    if (inDegree[id] === 0) queue.push(id);
+                });
+                
+                while (queue.length > 0) {
+                    const current = queue.shift();
+                    outEdges[current].forEach(next => {
+                        layers[next] = Math.max(layers[next], layers[current] + 1);
+                        inDegree[next]--;
+                        if (inDegree[next] === 0) queue.push(next);
+                    });
+                }
+                
+                // Group by layer
+                const layerGroups = {};
+                g.nodes().forEach(id => {
+                    const layer = layers[id];
+                    if (!layerGroups[layer]) layerGroups[layer] = [];
+                    layerGroups[layer].push(id);
+                });
+                
+                    // Position nodes
+                    const layerWidths = {};
+                    const startX = 0;
+                    
+                    Object.keys(layerGroups).forEach(layerIdx => {
+                        const layerNodes = layerGroups[layerIdx];
+                        const y = parseInt(layerIdx) * ranksep + 100;
+                        let x = startX;
+                        
+                        layerNodes.forEach(nodeId => {
+                            const node = g.node(nodeId);
+                            // Store center position but render from top-left logic later
+                            node.x = x + node.width / 2;
+                            node.y = y;
+                            x += node.width + nodesep;
+                        });
+                        layerWidths[layerIdx] = x;
+                    });
+                    
+                    // Create edge paths with routing to avoid nodes
+                    g.edges().forEach(edge => {
+                        const from = g.node(edge.v);
+                        const to = g.node(edge.w);
+                        const fromLayer = layers[edge.v];
+                        const toLayer = layers[edge.w];
+                        
+                        if (!from || !to) return;
+                        
+                        // Basic start and end points
+                        const startPoint = { x: from.x, y: from.y + from.height / 2 };
+                        const endPoint = { x: to.x, y: to.y - to.height / 2 };
+                        
+                        let points = [startPoint];
+                        
+                        // If edge spans multiple layers (skip connection), add intermediate points
+                        if (toLayer > fromLayer + 1) {
+                             // Find max width of intermediate layers to route around
+                             let maxIntermediateX = 0;
+                             for (let l = fromLayer + 1; l < toLayer; l++) {
+                                 if (layerWidths[l]) {
+                                     maxIntermediateX = Math.max(maxIntermediateX, layerWidths[l]);
+                                 }
+                             }
+                             
+                             // Add a buffer, varied slightly based on edge index to avoid overlap if multiple long edges exist
+                             // Simple hash of node IDs to vary offset
+                             const hash = (nodeId) => {
+                                 let h = 0;
+                                 for (let i = 0; i < nodeId.length; i++) h = ((h << 5) - h) + nodeId.charCodeAt(i) | 0;
+                                 return Math.abs(h);
+                             };
+                             
+                             const offsetVar = (hash(edge.v + edge.w) % 40); 
+                             const detourX = maxIntermediateX + 60 + offsetVar;
+                             
+                             // Add points for the detour
+                             // Adjust control points to create a smoother "C" curve
+                             points.push({ x: detourX, y: startPoint.y + 20 }); 
+                             points.push({ x: detourX, y: endPoint.y - 20 });
+                        }
+                        
+                        points.push(endPoint);
+                        
+                        if (edge.label) {
+                            edge.label.points = points;
+                        }
+                    });
+                }
+            };
+        
         // --- Logic ---
         const ui = {
             dropZone: document.getElementById('dropZone'),
@@ -432,6 +600,7 @@
                     state.modelInfo = d.model_info;
                     document.getElementById('fileName').textContent = file.name;
                     ui.convertBtn.disabled = false;
+                    ui.quantizeBtn.disabled = false;
                     log('模型上传成功。', 'success');
                     renderModel(d.model_info);
                 } else {
@@ -468,6 +637,42 @@
             canvas: null,
             ctx: null
         };
+
+        const EDGE_OFFSET = 10;
+        const EDGE_DETACH = 16;
+        const EDGE_COLORS = ['#2563eb', '#059669', '#d97706', '#db2777', '#9333ea', '#0f766e', '#22d3ee', '#f43f5e'];
+        const NODE_HEADER_HEIGHT = 22;
+        const DEFAULT_NODE_STYLE = {
+            header: '#475569',
+            body: '#f8fafc',
+            border: '#1f2937',
+            headerText: '#ffffff',
+            bodyText: '#1f2937'
+        };
+        const INPUT_NODE_STYLE = {
+            header: '#0ea5e9',
+            body: '#ecfeff',
+            border: '#0ea5e9',
+            headerText: '#ffffff',
+            bodyText: '#0369a1'
+        };
+        const OUTPUT_NODE_STYLE = {
+            header: '#22c55e',
+            body: '#ecfdf5',
+            border: '#16a34a',
+            headerText: '#ffffff',
+            bodyText: '#065f46'
+        };
+        const NODE_STYLE_PRESETS = [
+            { keywords: ['softmax'], header: '#b91c1c', body: '#fef2f2', border: '#991b1b', headerText: '#ffffff', bodyText: '#7f1d1d' },
+            { keywords: ['conv', 'gemm'], header: '#1d4ed8', body: '#eff6ff', border: '#1e40af', headerText: '#ffffff', bodyText: '#1e3a8a' },
+            { keywords: ['matmul'], header: '#0f172a', body: '#f3f4f6', border: '#0f172a', headerText: '#f8fafc', bodyText: '#111827' },
+            { keywords: ['add', 'mul', 'sub', 'div', 'pow'], header: '#111827', body: '#f1f5f9', border: '#0f172a', headerText: '#f8fafc', bodyText: '#111827' },
+            { keywords: ['relu', 'sigmoid', 'tanh', 'gelu', 'leakyrelu', 'elu'], header: '#92400e', body: '#fff7ed', border: '#78350f', headerText: '#fff7ed', bodyText: '#78350f' },
+            { keywords: ['reshape', 'transpose', 'squeeze', 'unsqueeze', 'flatten', 'view'], header: '#7c3aed', body: '#f5f3ff', border: '#6d28d9', headerText: '#ffffff', bodyText: '#4c1d95' },
+            { keywords: ['gather', 'slice', 'concat', 'pad', 'split'], header: '#047857', body: '#ecfdf5', border: '#065f46', headerText: '#ecfdf5', bodyText: '#064e3b' },
+            { keywords: ['reduce', 'mean', 'sum', 'pool'], header: '#0f766e', body: '#ecfeff', border: '#0d9488', headerText: '#ecfeff', bodyText: '#115e59' }
+        ];
         
         function renderGraphVisualization(info) {
             if (!info.nodes || !info.edges) {
@@ -524,93 +729,96 @@
         
         function calculateGraphLayout(info) {
             const nodeWidth = 180;
-            const nodeHeight = 80;
-            const layerSpacing = 120;  // Vertical spacing between layers
-            const nodeSpacing = 220;   // Horizontal spacing between nodes
+            const nodeHeight = 50;  // 更扁的节点
             
-            // Build adjacency information
+            // 创建 dagre 图对象
+            const g = new dagre.Graph({
+                directed: true,
+                multigraph: false,
+                compound: false
+            });
+            
+            // 设置图的全局属性
+            g.setGraph({
+                rankdir: 'TB',  // Top to Bottom
+                nodesep: 80,    // 节点间水平间距
+                ranksep: 100,    // 层级间垂直间距
+                marginx: 40,
+                marginy: 40
+            });
+            
+            g.setDefaultEdgeLabel(() => ({}));
+            
+            // Build node map
             const nodeMap = new Map();
-            const inDegree = new Map();
-            const outEdges = new Map();
             
             // Add input nodes
             info.inputs.forEach(inp => {
                 const id = `input_${inp.name}`;
-                nodeMap.set(id, { id, type: 'input', label: inp.name, shape: inp.shape, layer: 0 });
-                inDegree.set(id, 0);
-                outEdges.set(id, []);
+                const node = { id, type: 'input', label: inp.name, shape: inp.shape };
+                nodeMap.set(id, node);
+                g.setNode(id, { width: nodeWidth, height: nodeHeight, node });
             });
             
             // Add operation nodes
             info.nodes.forEach(node => {
-                nodeMap.set(node.id, { ...node, label: node.name, type: 'op', layer: -1 });
-                inDegree.set(node.id, 0);
-                outEdges.set(node.id, []);
+                const fullNode = { ...node, label: node.name, type: 'op' };
+                nodeMap.set(node.id, fullNode);
+                g.setNode(node.id, { width: nodeWidth, height: nodeHeight, node: fullNode });
             });
             
             // Add output nodes
             info.outputs.forEach(out => {
                 const id = `output_${out.name}`;
-                nodeMap.set(id, { id, type: 'output', label: out.name, shape: out.shape, layer: -1 });
-                inDegree.set(id, 0);
-                outEdges.set(id, []);
+                const node = { id, type: 'output', label: out.name, shape: out.shape };
+                nodeMap.set(id, node);
+                g.setNode(id, { width: nodeWidth, height: nodeHeight, node });
             });
             
             // Build edge connections
             info.edges.forEach(edge => {
                 if (nodeMap.has(edge.from) && nodeMap.has(edge.to)) {
-                    outEdges.get(edge.from).push(edge.to);
-                    inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+                    g.setEdge(edge.from, edge.to, { edge });
                 }
             });
             
-            // Topological sort to assign layers
-            const queue = [];
-            nodeMap.forEach((node, id) => {
-                if (inDegree.get(id) === 0) {
-                    queue.push(id);
-                }
-            });
+            // 使用 dagre 计算布局
+            dagre.layout(g);
             
-            while (queue.length > 0) {
-                const current = queue.shift();
-                const currentNode = nodeMap.get(current);
-                
-                outEdges.get(current).forEach(neighbor => {
-                    const neighborNode = nodeMap.get(neighbor);
-                    neighborNode.layer = Math.max(neighborNode.layer, currentNode.layer + 1);
-                    
-                    inDegree.set(neighbor, inDegree.get(neighbor) - 1);
-                    if (inDegree.get(neighbor) === 0) {
-                        queue.push(neighbor);
-                    }
-                });
-            }
-            
-            // Group nodes by layer
-            const layers = [];
-            nodeMap.forEach(node => {
-                if (!layers[node.layer]) layers[node.layer] = [];
-                layers[node.layer].push(node);
-            });
-            
-            // Assign positions (vertical layout)
+            // 提取计算后的位置
             const positions = new Map();
-            layers.forEach((layerNodes, layerIdx) => {
-                const y = layerIdx * layerSpacing + 80;  // Vertical position
-                layerNodes.forEach((node, idx) => {
-                    const totalWidth = (layerNodes.length - 1) * nodeSpacing;
-                    const x = idx * nodeSpacing - totalWidth / 2 + 400;  // Horizontal position
-                    positions.set(node.id, { 
-                        x, y, 
-                        width: nodeWidth, 
-                        height: nodeHeight,
-                        node 
-                    });
+            g.nodes().forEach(nodeId => {
+                const dagreNode = g.node(nodeId);
+                const node = dagreNode.node;
+                // dagre 返回的是中心点坐标，转换为左上角坐标
+                positions.set(nodeId, {
+                    x: dagreNode.x - nodeWidth / 2,
+                    y: dagreNode.y - nodeHeight / 2,
+                    width: nodeWidth,
+                    height: nodeHeight,
+                    node
                 });
+            });
+            
+            // 提取边的路径点
+            const edgePoints = new Map();
+            g.edges().forEach(edgeObj => {
+                const edge = g.edge(edgeObj);
+                if (edge && edge.points) {
+                    const key = `${edgeObj.v}-${edgeObj.w}`;
+                    edgePoints.set(key, edge.points || []);
+                }
             });
 
-            return { positions, edges: info.edges, nodeMap, tensorShapes: buildTensorShapeMap(info) };
+            const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+            positions.forEach(pos => {
+                bounds.minX = Math.min(bounds.minX, pos.x);
+                bounds.minY = Math.min(bounds.minY, pos.y);
+                bounds.maxX = Math.max(bounds.maxX, pos.x + pos.width);
+                bounds.maxY = Math.max(bounds.maxY, pos.y + pos.height);
+            });
+
+            return { positions, edges: info.edges, nodeMap, tensorShapes: buildTensorShapeMap(info), bounds, edgePoints };
         }
         
         function buildTensorShapeMap(info) {
@@ -657,45 +865,7 @@
             
             // Draw edges first (behind nodes) if enabled
             if (graphState.showLines) {
-                layout.edges.forEach(edge => {
-                    const from = layout.positions.get(edge.from);
-                    const to = layout.positions.get(edge.to);
-                    
-                    if (from && to) {
-                        // Vertical layout: from bottom to top
-                        const x1 = from.x + from.width / 2;
-                        const y1 = from.y + from.height;
-                        const x2 = to.x + to.width / 2;
-                        const y2 = to.y;
-                        
-                        // Draw curved line
-                        const midY = (y1 + y2) / 2;
-                        
-                        ctx.beginPath();
-                        ctx.moveTo(x1, y1);
-                        ctx.bezierCurveTo(x1, midY, x2, midY, x2, y2);
-                        ctx.strokeStyle = '#cbd5e1';
-                        ctx.lineWidth = 2;
-                        ctx.stroke();
-                        
-                        // Draw arrow
-                        const angle = Math.atan2(y2 - y1, x2 - x1);
-                        const arrowSize = 8;
-                        ctx.beginPath();
-                        ctx.moveTo(x2, y2);
-                        ctx.lineTo(
-                            x2 - arrowSize * Math.cos(angle - Math.PI / 6),
-                            y2 - arrowSize * Math.sin(angle - Math.PI / 6)
-                        );
-                        ctx.lineTo(
-                            x2 - arrowSize * Math.cos(angle + Math.PI / 6),
-                            y2 - arrowSize * Math.sin(angle + Math.PI / 6)
-                        );
-                        ctx.closePath();
-                        ctx.fillStyle = '#cbd5e1';
-                        ctx.fill();
-                    }
-                });
+                layout.edges.forEach((edge, idx) => drawDagreEdge(ctx, layout, edge, idx));
             }
             
             // Draw nodes
@@ -705,74 +875,178 @@
                 const w = pos.width;
                 const h = pos.height;
                 const node = pos.node;
-                
-                // Draw card shadow
-                ctx.shadowColor = 'rgba(0, 0, 0, 0.1)';
-                ctx.shadowBlur = 8;
+                const style = getNodeStyle(node);
+
+                // Card shadow
+                ctx.shadowColor = 'rgba(15, 23, 42, 0.18)';
+                ctx.shadowBlur = 10;
                 ctx.shadowOffsetX = 0;
-                ctx.shadowOffsetY = 2;
-                
-                // Draw card background
-                ctx.fillStyle = '#ffffff';
-                if (node.type === 'input') {
-                    ctx.fillStyle = '#e0f2fe';
-                } else if (node.type === 'output') {
-                    ctx.fillStyle = '#dcfce7';
-                }
-                
-                roundRect(ctx, x, y, w, h, 8);
+                ctx.shadowOffsetY = 3;
+
+                roundRect(ctx, x, y, w, h, 10);
+                ctx.fillStyle = style.body;
                 ctx.fill();
-                
-                // Draw border
+
                 ctx.shadowColor = 'transparent';
-                ctx.strokeStyle = '#e5e7eb';
-                if (node.type === 'input') {
-                    ctx.strokeStyle = '#0ea5e9';
-                } else if (node.type === 'output') {
-                    ctx.strokeStyle = '#22c55e';
-                }
-                ctx.lineWidth = 2;
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = style.border;
                 ctx.stroke();
+
+                // Header strip
+                ctx.fillStyle = style.header;
+                ctx.beginPath();
+                // Top-left corner (rounded)
+                ctx.moveTo(x, y + NODE_HEADER_HEIGHT);
+                ctx.lineTo(x, y + 10); // 10 is radius
+                ctx.arcTo(x, y, x + 10, y, 10);
                 
-                // Draw node text
-                ctx.fillStyle = '#1e293b';
-                ctx.font = 'bold 11px system-ui, sans-serif';
+                // Top edge
+                ctx.lineTo(x + w - 10, y);
+                
+                // Top-right corner (rounded)
+                ctx.arcTo(x + w, y, x + w, y + 10, 10);
+                
+                // Right edge down to header height
+                ctx.lineTo(x + w, y + NODE_HEADER_HEIGHT);
+                
+                // Bottom edge of header
+                ctx.lineTo(x, y + NODE_HEADER_HEIGHT);
+                
+                ctx.closePath();
+                ctx.fill();
+
+                // Header text
+                ctx.fillStyle = style.headerText;
+                ctx.font = 'bold 11px "Segoe UI", system-ui, sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                
-                let labelText = node.label || node.id;
-                if (labelText.length > 20) labelText = labelText.substring(0, 17) + '...';
-                ctx.fillText(labelText, x + w / 2, y + h / 2 - 16);
-                
-                // Draw operation type
-                ctx.fillStyle = '#64748b';
-                ctx.font = '10px ui-monospace, monospace';
-                
-                let subtext = '';
-                if (node.type === 'op') {
-                    subtext = node.op_type;
-                } else if (node.shape) {
-                    const shapeStr = JSON.stringify(node.shape);
-                    subtext = shapeStr.length > 25 ? shapeStr.substring(0, 22) + '...' : shapeStr;
+                const headerLabel = truncateText(getNodeHeaderLabel(node), 18);
+                ctx.fillText(headerLabel, x + w / 2, y + NODE_HEADER_HEIGHT / 2 + 1);
+
+                // Body text
+                ctx.fillStyle = style.bodyText;
+                ctx.font = '10px "Segoe UI", system-ui, sans-serif';
+                const primaryLabel = truncateText(getNodeBodyLabel(node), 22);
+                ctx.fillText(primaryLabel, x + w / 2, y + NODE_HEADER_HEIGHT + 12);
+
+                const shapeText = getNodeShapeLabel(node, layout.tensorShapes);
+                if (shapeText) {
+                    ctx.fillStyle = style.bodyText;
+                    ctx.font = '9px ui-monospace, monospace';
+                    ctx.fillText(shapeText, x + w / 2, y + h - 10);
                 }
-                ctx.fillText(subtext, x + w / 2, y + h / 2);
-                
-                // Draw input shape info
+
+                // Additional input shape hint
                 if (node.type === 'op' && node.inputs && node.inputs.length > 0) {
                     const inputShape = getInputShape(node, layout.tensorShapes);
                     if (inputShape) {
                         ctx.fillStyle = '#059669';
                         ctx.font = '9px ui-monospace, monospace';
-                        const shapeText = 'In: ' + formatShape(inputShape);
-                        ctx.fillText(shapeText, x + w / 2, y + h / 2 + 16);
+                        const shapeLabel = 'In: ' + formatShape(inputShape);
+                        ctx.fillText(truncateText(shapeLabel, 28), x + w / 2, y + h - 24);
                     }
                 }
-                
-                // Reset shadow
+
                 ctx.shadowColor = 'transparent';
             });
             
             ctx.restore();
+        }
+
+        function drawDagreEdge(ctx, layout, edge, idx) {
+            const fromPos = layout.positions.get(edge.from);
+            const toPos = layout.positions.get(edge.to);
+            if (!fromPos || !toPos) return;
+
+            const key = `${edge.from}-${edge.to}`;
+            let points = layout.edgePoints && layout.edgePoints.get(key);
+            
+            // 如果 dagre 没有提供路径点，使用默认直线
+            if (!points || points.length === 0) {
+                const fromCenter = { x: fromPos.x + fromPos.width / 2, y: fromPos.y + fromPos.height };
+                const toCenter = { x: toPos.x + toPos.width / 2, y: toPos.y };
+                points = [fromCenter, toCenter];
+            }
+
+            // 绘制平滑曲线
+            const color = EDGE_COLORS[idx % EDGE_COLORS.length];
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            
+            if (points.length === 2) {
+                // 直线：使用简单的曲线
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, points[0].y);
+                const midY = (points[0].y + points[1].y) / 2;
+                ctx.bezierCurveTo(
+                    points[0].x, midY,
+                    points[1].x, midY,
+                    points[1].x, points[1].y
+                );
+                ctx.stroke();
+            } else {
+                // 多点路径：绘制平滑曲线
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, points[0].y);
+                
+                // 如果是简单的绕行路径（4个点：起点，折点1，折点2，终点），我们使用三次贝塞尔曲线
+                if (points.length === 4) {
+                     ctx.bezierCurveTo(
+                        points[1].x, points[1].y,
+                        points[2].x, points[2].y,
+                        points[3].x, points[3].y
+                    );
+                } else {
+                    for (let i = 1; i < points.length - 1; i++) {
+                        const xc = (points[i].x + points[i + 1].x) / 2;
+                        const yc = (points[i].y + points[i + 1].y) / 2;
+                        ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
+                    }
+                    ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+                }
+                ctx.stroke();
+            }
+
+            // 绘制箭头
+            const lastFrom = points[points.length - 2];
+            const lastTo = points[points.length - 1];
+            drawArrowHead(ctx, lastFrom, lastTo, color);
+        }
+
+        function drawArrowHead(ctx, from, to, color) {
+            if (!from || !to) return;
+            const angle = Math.atan2(to.y - from.y, to.x - from.x);
+            const size = 8;
+            ctx.beginPath();
+            ctx.moveTo(to.x, to.y);
+            ctx.lineTo(
+                to.x - size * Math.cos(angle - Math.PI / 6),
+                to.y - size * Math.sin(angle - Math.PI / 6)
+            );
+            ctx.lineTo(
+                to.x - size * Math.cos(angle + Math.PI / 6),
+                to.y - size * Math.sin(angle + Math.PI / 6)
+            );
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+        }
+
+        function getEdgeColor(edge) {
+            const key = `${edge.from}->${edge.to}`;
+            const idx = Math.abs(hashString(key)) % EDGE_COLORS.length;
+            return EDGE_COLORS[idx];
+        }
+
+        function hashString(str) {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+                hash = ((hash << 5) - hash) + str.charCodeAt(i);
+                hash |= 0;
+            }
+            return hash;
         }
         
         // Helper function to get input shape
@@ -796,6 +1070,54 @@
                 if (typeof dim === 'number') return dim;
                 return '?';
             }).join(',') + ']';
+        }
+
+        function getNodeStyle(node) {
+            if (node.type === 'input') return INPUT_NODE_STYLE;
+            if (node.type === 'output') return OUTPUT_NODE_STYLE;
+
+            const op = (node.op_type || '').toLowerCase();
+            for (const preset of NODE_STYLE_PRESETS) {
+                if (preset.keywords.some(keyword => op.includes(keyword))) {
+                    return preset;
+                }
+            }
+            return DEFAULT_NODE_STYLE;
+        }
+
+        function getNodeHeaderLabel(node) {
+            if (node.type === 'input') return 'Input';
+            if (node.type === 'output') return 'Output';
+            return node.op_type || node.label || node.id;
+        }
+
+        function getNodeBodyLabel(node) {
+            if (node.type === 'input' || node.type === 'output') {
+                return node.label || node.id;
+            }
+            if (node.label && node.label !== node.op_type) {
+                return node.label;
+            }
+            return node.id || '';
+        }
+
+        function getNodeShapeLabel(node, tensorShapes) {
+            if (node.shape && (node.type === 'input' || node.type === 'output')) {
+                return formatShape(node.shape);
+            }
+
+            const outputs = node.outputs || [];
+            for (const out of outputs) {
+                if (tensorShapes && tensorShapes.has(out)) {
+                    return formatShape(tensorShapes.get(out));
+                }
+            }
+            return '';
+        }
+
+        function truncateText(text, max = 20) {
+            if (!text) return '';
+            return text.length > max ? text.substring(0, max - 3) + '...' : text;
         }
         
         // Helper function to draw rounded rectangles
@@ -866,13 +1188,19 @@
         };
         
         document.getElementById('btnZoomIn').onclick = () => {
-            graphState.scale *= 1.2;
-            updateTransform();
+            // Zoom towards center of canvas
+            const container = document.getElementById('graphContainer');
+            const centerX = container.clientWidth / 2;
+            const centerY = container.clientHeight / 2;
+            zoomAtPoint(centerX, centerY, 1.2);
         };
         
         document.getElementById('btnZoomOut').onclick = () => {
-            graphState.scale /= 1.2;
-            updateTransform();
+            // Zoom towards center of canvas
+            const container = document.getElementById('graphContainer');
+            const centerX = container.clientWidth / 2;
+            const centerY = container.clientHeight / 2;
+            zoomAtPoint(centerX, centerY, 1 / 1.2);
         };
         
         document.getElementById('btnZoomFit').onclick = fitToView;
@@ -917,10 +1245,33 @@
         // Zoom with mouse wheel
         graphContainer.addEventListener('wheel', (e) => {
             e.preventDefault();
-            const delta = e.deltaY > 0 ? 0.9 : 1.1;
-            graphState.scale *= delta;
-            updateTransform();
+            
+            // Get mouse position relative to canvas
+            const rect = graphContainer.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            
+            // Zoom factor
+            const delta = e.deltaY > 0 ? 1 / 1.1 : 1.1;
+            
+            // Zoom at mouse position
+            zoomAtPoint(mouseX, mouseY, delta);
         });
+        
+        function zoomAtPoint(clientX, clientY, scaleFactor) {
+            // Calculate world coordinates before zoom
+            const worldX = (clientX - graphState.translateX) / graphState.scale;
+            const worldY = (clientY - graphState.translateY) / graphState.scale;
+            
+            // Apply scale
+            graphState.scale *= scaleFactor;
+            
+            // Calculate new translation to keep the same world point under the mouse
+            graphState.translateX = clientX - worldX * graphState.scale;
+            graphState.translateY = clientY - worldY * graphState.scale;
+            
+            updateTransform();
+        }
 
         function getSettings() {
             return {
@@ -1001,6 +1352,14 @@
                         document.getElementById('resOrig').textContent = (d.stats.original_size/1024).toFixed(2) + " KB";
                         document.getElementById('resNew').textContent = (d.stats.converted_size/1024).toFixed(2) + " KB";
                         document.getElementById('resTime').textContent = d.stats.time;
+                        
+                        // Show inference time if available
+                        if(d.stats.inference_time) {
+                            document.getElementById('resInferenceTime').textContent = d.stats.inference_time;
+                            document.getElementById('inferenceTimeRow').style.display = 'flex';
+                        } else {
+                            document.getElementById('inferenceTimeRow').style.display = 'none';
+                        }
                     }
                     
                     const btnQ = document.getElementById('dlOnnxQ');
@@ -1034,7 +1393,18 @@
                     document.getElementById('resOrig').textContent = (data.stats.original_size/1024).toFixed(2) + " KB";
                     document.getElementById('resNew').textContent = (data.stats.converted_size/1024).toFixed(2) + " KB";
                     document.getElementById('resTime').textContent = data.stats.time;
+                    
+                    // Show inference time if available
+                    if(data.stats.inference_time) {
+                        document.getElementById('resInferenceTime').textContent = data.stats.inference_time;
+                        document.getElementById('inferenceTimeRow').style.display = 'flex';
+                    } else {
+                        document.getElementById('inferenceTimeRow').style.display = 'none';
+                    }
                 }
+                
+                // Hide quantized ONNX download button for regular conversion
+                document.getElementById('dlOnnxQ').classList.add('hidden');
                 
                 // Display accuracy comparison if available
                 if(data.accuracy) {
